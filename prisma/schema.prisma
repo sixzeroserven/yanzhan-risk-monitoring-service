@@ -1,0 +1,59 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model OrderAddress {
+  id            Int      @id @default(autoincrement()) @map("addr_id")
+  sourceId      String?  @map("source_id") @db.VarChar(50)
+  orderId       String   @unique @map("order_id") @db.VarChar(100)
+  phoneNumber   String?  @map("phone_number") @db.VarChar(50)
+  country       String?  @db.VarChar(10)
+  province      String?  @db.VarChar(100)
+  city          String?  @db.VarChar(100)
+  district      String?  @db.VarChar(100)
+  contactPerson String?  @map("contact_person") @db.VarChar(200)
+  mobile        String?  @db.VarChar(50)
+  detailAddress String?  @map("detail_address") @db.Text
+  address2      String? @db.VarChar(255)
+  email         String? @db.VarChar(200)
+  createdAt     DateTime @default(now()) @map("created_at") @db.DateTime(0)
+  updatedAt     DateTime @default(now()) @updatedAt @map("updated_at") @db.DateTime(0)
+
+  @@map("order_address")
+}
+
+model Order {
+  id            Int       @id @default(autoincrement())
+  orderId       String    @map("order_id") @db.VarChar(100)
+  packageNumber String    @map("package_number") @db.VarChar(100)
+  buyerName     String?   @map("buyer_name") @db.VarChar(200)
+  contactName   String?   @map("contact_name") @db.VarChar(200)
+  buyerAccount  String?   @map("buyer_account") @db.VarChar(200)
+  buyerCountry  String?   @map("buyer_country") @db.VarChar(10)
+  blackState    Boolean   @default(false) @map("black_state")
+  createdAt     DateTime? @default(now()) @map("created_at") @db.DateTime(0)
+  updatedAt     DateTime? @default(now()) @updatedAt @map("updated_at") @db.DateTime(0)
+
+  @@unique([orderId, packageNumber], map: "uk_order_package")
+  @@index([orderId], map: "idx_order_id")
+  @@index([packageNumber], map: "idx_package_number")
+  @@map("orders")
+}
+
+model OrderDeviceFingerprint {
+  id                BigInt    @id @default(autoincrement())
+  orderId           String    @map("order_id") @db.VarChar(100)
+  deviceFingerprint String    @map("device_fingerprint") @db.VarChar(255)
+  createdAt         DateTime? @default(now()) @map("created_at") @db.DateTime(0)
+  updatedAt         DateTime? @default(now()) @updatedAt @map("updated_at") @db.DateTime(0)
+
+  @@unique([orderId, deviceFingerprint], map: "uk_order_device")
+  @@index([orderId], map: "idx_order_id")
+  @@index([deviceFingerprint], map: "idx_device_fingerprint")
+  @@map("order_device_fingerprint")
+}
