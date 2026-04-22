@@ -1,11 +1,25 @@
-import { Injectable } from "@nestjs/common";
+import { BadRequestException, Injectable, Logger, OnModuleInit } from "@nestjs/common";
 import axios from "axios";
 import * as crypto from "crypto";
 import { EnvConfig } from "../common/config/env.config";
 
 @Injectable()
-export class ShoplazzaService {
+export class ShoplazzaService implements OnModuleInit {
+  private readonly logger = new Logger(ShoplazzaService.name);
   constructor(private readonly env: EnvConfig) {}
+
+  async onModuleInit(): Promise<void> {
+    if (!this.env.shoplazza.autoSubscribeWebhook) return;
+    try {
+      const result = await this.subscribeOrderCreateWebhook();
+      this.logger.log(
+        `Auto-subscribed Shoplazza webhook: event=orders/create callback=${result.callback_url}`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error(`Auto-subscribe Shoplazza webhook failed: ${message}`);
+    }
+  }
 
   verifyWebhookSignature(rawBody: Buffer, providedHmac?: string): boolean {
     if (!providedHmac || !rawBody) return false;
@@ -27,6 +41,31 @@ export class ShoplazzaService {
     await this.client.put(this.path(this.env.shoplazza.updateOrderPathTemplate, orderId), {
       order: { id: orderId, note }
     });
+  }
+
+  async subscribeOrderCreateWebhook(callbackUrl?: string) {
+    const address = (callbackUrl || this.env.shoplazza.webhookCallbackUrl || "").trim();
+    if (!address) {
+      throw new BadRequestException(
+        "callback_url is required. Set SHOPLAZZA_WEBHOOK_CALLBACK_URL or pass callback_url in request body."
+      );
+    }
+
+    const path = this.env.shoplazza.subscribeWebhookPathTemplate.replace(
+      "{version}",
+      encodeURIComponent(this.env.shoplazza.apiVersion)
+    );
+    const payload = {
+      event: "orders/create",
+      address
+    };
+    const resp = await this.client.post(path, payload);
+    return {
+      success: true,
+      callback_url: address,
+      api_path: path,
+      data: resp.data
+    };
   }
 
   private get client() {

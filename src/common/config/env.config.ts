@@ -49,6 +49,11 @@ export class EnvConfig {
       adminToken: process.env.SHOPLAZZA_ADMIN_TOKEN as string,
       webhookSecret: process.env.SHOPLAZZA_WEBHOOK_SECRET as string,
       timeoutMs: Number(process.env.SHOPLAZZA_TIMEOUT_MS || 10000),
+      autoSubscribeWebhook: String(process.env.SHOPLAZZA_AUTO_SUBSCRIBE_WEBHOOK || "false") === "true",
+      apiVersion: process.env.SHOPLAZZA_API_VERSION || "2020-07",
+      subscribeWebhookPathTemplate:
+        process.env.SHOPLAZZA_SUBSCRIBE_WEBHOOK_PATH_TEMPLATE || "/openapi/{version}/webhooks/subscribe",
+      webhookCallbackUrl: process.env.SHOPLAZZA_WEBHOOK_CALLBACK_URL || "",
       cancelOrderPathTemplate:
         process.env.SHOPLAZZA_CANCEL_ORDER_PATH_TEMPLATE ||
         "/admin/openapi/2020-07/orders/{orderId}/cancel.json",

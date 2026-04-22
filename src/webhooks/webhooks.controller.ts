@@ -12,6 +12,23 @@ export class WebhooksController {
     private readonly webhooksService: WebhooksService
   ) {}
 
+  @Post("subscribe")
+  @ApiOperation({ summary: "Subscribe current backend URL to Shoplazza orders/create webhook" })
+  @ApiBody({
+    schema: {
+      type: "object",
+      properties: {
+        callback_url: {
+          type: "string",
+          example: "https://your-domain.com/webhooks/shoplazza/orders/create"
+        }
+      }
+    }
+  })
+  async subscribe(@Body() body: Record<string, unknown>) {
+    return this.shoplazzaService.subscribeOrderCreateWebhook(String(body?.callback_url || ""));
+  }
+
   @Post("create")
   @ApiOperation({ summary: "Handle Shoplazza orders/create webhook" })
   @ApiHeader({
