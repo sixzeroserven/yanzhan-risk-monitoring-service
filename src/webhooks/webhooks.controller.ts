@@ -1,7 +1,8 @@
-import { Body, Controller, Headers, Post, Req, UnauthorizedException } from "@nestjs/common";
-import { ApiBody, ApiHeader, ApiOperation, ApiTags } from "@nestjs/swagger";
+import { Body, Controller, Get, Headers, Post, Query, Req, UnauthorizedException } from "@nestjs/common";
+import { ApiBody, ApiHeader, ApiOperation, ApiQuery, ApiTags } from "@nestjs/swagger";
 import { Request } from "express";
 import { ShoplazzaService } from "../shoplazza/shoplazza.service";
+import { extractOrderPayload } from "./webhook-order.util";
 import { WebhooksService } from "./webhooks.service";
 
 @ApiTags("webhooks")
@@ -13,28 +14,45 @@ export class WebhooksController {
   ) {}
 
   @Post("subscribe")
-  @ApiOperation({ summary: "Subscribe current backend URL to Shoplazza orders/create webhook" })
+  @ApiOperation({ summary: "订阅 Shoplazza orders/update webhook" })
   @ApiBody({
     schema: {
       type: "object",
       properties: {
         callback_url: {
           type: "string",
-          example: "https://your-domain.com/webhooks/shoplazza/orders/create"
+          example: "https://your-domain.com/webhooks/shoplazza/orders/update"
         }
       }
     }
   })
   async subscribe(@Body() body: Record<string, unknown>) {
-    return this.shoplazzaService.subscribeOrderCreateWebhook(String(body?.callback_url || ""));
+    return this.shoplazzaService.subscribeOrderUpdateWebhook(String(body?.callback_url || ""));
   }
 
-  @Post("create")
-  @ApiOperation({ summary: "Handle Shoplazza orders/create webhook" })
+  @Get("subscriptions")
+  @ApiOperation({ summary: "列出当前 Shoplazza webhook 订阅" })
+  async listSubscriptions() {
+    return this.shoplazzaService.listWebhooks();
+  }
+
+  @Post("subscriptions/cleanup")
+  @ApiOperation({ summary: "清理非保留 topic 的 webhook 订阅（默认保留 orders/update）" })
+  @ApiQuery({ name: "keepTopics", description: "保留的 topic，多个 topic 用逗号分隔", required: false })
+  async cleanupSubscriptions(@Query("keepTopics") keepTopics?: string) {
+    const topics = (keepTopics || "orders/update")
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    return this.shoplazzaService.cleanupWebhooks(topics);
+  }
+
+  @Post("update")
+  @ApiOperation({ summary: "处理 Shoplazza orders/update webhook" })
   @ApiHeader({
     name: "x-shoplazza-hmac-sha256",
     required: true,
-    description: "Webhook HMAC signature"
+    description: "Webhook HMAC 签名"
   })
   @ApiBody({
     schema: {
@@ -43,49 +61,19 @@ export class WebhooksController {
       properties: {
         id: { oneOf: [{ type: "string" }, { type: "number" }], example: "ORDER_20001" },
         order_id: { oneOf: [{ type: "string" }, { type: "number" }], example: "ORDER_20001" },
-        order_number: { oneOf: [{ type: "string" }, { type: "number" }], example: "ORDER_20001" },
-        email: { type: "string", example: "risk.user@example.com" },
-        phone: { type: "string", example: "+1 415-555-1234" },
-        shipping_address: {
-          type: "object",
-          description: "Blacklist uses phone and address2 only here (not mobile, address1, city, etc.).",
-          properties: {
-            name: { type: "string", example: "Risk User" },
-            phone: { type: "string", example: "+1 415-555-1234" },
-            address2: { type: "string", example: "Apt 6" }
-          }
-        },
-        billing_address: {
-          type: "object",
-          description: "Blacklist uses phone and address2 only here (not mobile, address1, city, etc.).",
-          properties: {
-            name: { type: "string", example: "Risk User" },
-            phone: { type: "string", example: "+1 415-555-1234" },
-            address2: { type: "string", example: "Apt 6" }
-          }
-        },
-        note_attributes: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              name: { type: "string", example: "device_fingerprint" },
-              value: { type: "string", example: "fp_test_abc_001" }
-            }
-          }
-        },
-        device_fingerprint: { type: "string", example: "fp_test_abc_001" }
+        order_number: { oneOf: [{ type: "string" }, { type: "number" }], example: "ORDER_20001" }
       }
     }
   })
-  async handleOrderCreate(
+  async handleOrderUpdate(
     @Req() req: Request & { rawBody?: Buffer },
     @Body() body: Record<string, unknown>,
     @Headers("x-shoplazza-hmac-sha256") hmac?: string
   ) {
     if (!this.shoplazzaService.verifyWebhookSignature(req.rawBody as Buffer, hmac)) {
-      throw new UnauthorizedException("Invalid webhook signature");
+      throw new UnauthorizedException("Webhook 签名无效");
     }
-    return this.webhooksService.processOrderCreate(body || {});
+    const order = extractOrderPayload(body || {});
+    return this.webhooksService.processOrderUpdate(order);
   }
 }

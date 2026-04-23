@@ -49,6 +49,7 @@ export class EnvConfig {
       adminToken: process.env.SHOPLAZZA_ADMIN_TOKEN as string,
       webhookSecret: process.env.SHOPLAZZA_WEBHOOK_SECRET as string,
       timeoutMs: Number(process.env.SHOPLAZZA_TIMEOUT_MS || 10000),
+      insecureTls: String(process.env.SHOPLAZZA_INSECURE_TLS || "false") === "true",
       autoSubscribeWebhook: String(process.env.SHOPLAZZA_AUTO_SUBSCRIBE_WEBHOOK || "false") === "true",
       apiVersion: process.env.SHOPLAZZA_API_VERSION || "2020-07",
       subscribeWebhookPathTemplate:

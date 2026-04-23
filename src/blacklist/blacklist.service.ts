@@ -34,11 +34,42 @@ export class BlacklistService {
   }
 
   async checkByOrder(order: Record<string, unknown>) {
-    const shipping = (order.shipping_address as Record<string, unknown>) || {};
-    const billing = (order.billing_address as Record<string, unknown>) || {};
+    const shipping = this.asObject(order.shipping_address);
+    const billing = this.asObject(order.billing_address);
+    const customer = this.asObject(order.customer);
+    const email = this.pickFirstString(
+      order.email,
+      order.contact_email,
+      customer.email,
+      customer.contact_email,
+      shipping.email,
+      billing.email,
+      this.findFirstDeepString(order, new Set(["email", "contact_email", "buyer_account"]))
+    );
+    const phoneNumber = this.pickFirstString(
+      order.phone_number,
+      order.phone,
+      order.mobile,
+      shipping.phone,
+      shipping.phone_number,
+      shipping.mobile,
+      shipping.tel,
+      billing.phone,
+      billing.phone_number,
+      billing.mobile,
+      billing.tel,
+      customer.phone,
+      customer.phone_number,
+      customer.mobile,
+      customer.tel,
+      this.findFirstDeepString(
+        order,
+        new Set(["phone", "phone_number", "mobile", "tel", "telephone", "contact_phone"])
+      )
+    );
     const contact = {
-      email: normalizeEmail(order.email),
-      phoneNumber: normalizePhone(order.phone_number || shipping.phone || billing.phone || order.phone),
+      email: normalizeEmail(email),
+      phoneNumber: normalizePhone(phoneNumber),
       detailAddress: normalizeAddress(shipping.detail_address || billing.detail_address),
       address2: normalizeAddress(shipping.address2 || billing.address2),
       fingerprint: safeString(getDeviceFingerprint(order))
@@ -50,9 +81,9 @@ export class BlacklistService {
     const orderId = safeString(order.id || order.order_id || order.order_number);
     if (!orderId) return;
 
-    const shipping = (order.shipping_address as Record<string, unknown>) || {};
-    const billing = (order.billing_address as Record<string, unknown>) || {};
-    const customer = (order.customer as Record<string, unknown>) || {};
+    const shipping = this.asObject(order.shipping_address);
+    const billing = this.asObject(order.billing_address);
+    const customer = this.asObject(order.customer);
 
     await this.db.orderAddress.upsert({
       where: { orderId },
@@ -247,5 +278,65 @@ export class BlacklistService {
       fingerprint
     );
     return rows as BlacklistHit[];
+  }
+
+  private pickFirstString(...values: unknown[]): string {
+    for (const value of values) {
+      if (value === null || value === undefined) continue;
+      const text = String(value).trim();
+      if (text) return text;
+    }
+    return "";
+  }
+
+  private asObject(value: unknown): Record<string, unknown> {
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      return value as Record<string, unknown>;
+    }
+    if (typeof value === "string") {
+      try {
+        const parsed = JSON.parse(value) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          return parsed as Record<string, unknown>;
+        }
+      } catch {
+        // Ignore parse errors and fall back to empty object.
+      }
+    }
+    return {};
+  }
+
+  private findFirstDeepString(root: unknown, targetKeys: Set<string>): string {
+    const visited = new Set<unknown>();
+    const walk = (value: unknown, depth: number): string => {
+      if (depth > 8 || value === null || value === undefined) return "";
+      if (typeof value === "string") return "";
+      if (typeof value !== "object") return "";
+      if (visited.has(value)) return "";
+      visited.add(value);
+
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          const found = walk(item, depth + 1);
+          if (found) return found;
+        }
+        return "";
+      }
+
+      const record = value as Record<string, unknown>;
+      for (const [key, fieldValue] of Object.entries(record)) {
+        if (targetKeys.has(key.toLowerCase())) {
+          const text = this.pickFirstString(fieldValue);
+          if (text) return text;
+        }
+      }
+      for (const fieldValue of Object.values(record)) {
+        const found = walk(fieldValue, depth + 1);
+        if (found) return found;
+      }
+      return "";
+    };
+
+    return walk(root, 0);
   }
 }

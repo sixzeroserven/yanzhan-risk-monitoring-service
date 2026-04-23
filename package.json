@@ -7,7 +7,7 @@
     "prisma:generate": "prisma generate",
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/main.js",
-    "start:dev": "ts-node -r tsconfig-paths/register src/main.ts",
+    "start:dev": "node --watch --watch-path src -r ts-node/register -r tsconfig-paths/register src/main.ts",
     "dev": "npm run prisma:generate && npm run start:dev"
   },
   "keywords": [
