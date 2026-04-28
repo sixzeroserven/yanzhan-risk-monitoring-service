@@ -70,7 +70,7 @@ export class BlacklistService {
     const contact = {
       email: normalizeEmail(email),
       phoneNumber: normalizePhone(phoneNumber),
-      detailAddress: normalizeAddress(shipping.detail_address || billing.detail_address),
+      detailAddress: normalizeAddress(shipping.address1 || billing.detail_address),
       address2: normalizeAddress(shipping.address2 || billing.address2),
       fingerprint: safeString(getDeviceFingerprint(order))
     };
@@ -209,7 +209,7 @@ export class BlacklistService {
       `
       SELECT o.id, o.order_id, o.package_number, 'email' AS hit_type, oa.email AS hit_value
       FROM order_address oa
-      INNER JOIN orders o ON o.order_id = oa.order_id
+      INNER JOIN orders o ON BINARY o.order_id = BINARY oa.order_id
       WHERE o.black_state = 1
         AND LOWER(TRIM(oa.email)) = ?
       LIMIT 20
@@ -225,7 +225,7 @@ export class BlacklistService {
       `
       SELECT o.id, o.order_id, o.package_number, 'phone_number' AS hit_type, oa.phone_number AS hit_value
        FROM order_address oa
-       INNER JOIN orders o ON o.order_id = oa.order_id
+       INNER JOIN orders o ON BINARY o.order_id = BINARY oa.order_id
        WHERE o.black_state = 1
          AND REPLACE(REPLACE(REPLACE(COALESCE(oa.phone_number, ''), ' ', ''), '-', ''), '(', '') LIKE ?
        LIMIT 20
@@ -241,7 +241,7 @@ export class BlacklistService {
       `
       SELECT o.id, o.order_id, o.package_number, 'detail_address' AS hit_type, oa.detail_address AS hit_value
        FROM order_address oa
-       INNER JOIN orders o ON o.order_id = oa.order_id
+       INNER JOIN orders o ON BINARY o.order_id = BINARY oa.order_id
        WHERE o.black_state = 1
          AND LOWER(TRIM(COALESCE(oa.detail_address, ''))) LIKE ?
        LIMIT 20
@@ -257,7 +257,7 @@ export class BlacklistService {
       `
       SELECT o.id, o.order_id, o.package_number, 'address2' AS hit_type, oa.address2 AS hit_value
       FROM order_address oa
-      INNER JOIN orders o ON o.order_id = oa.order_id
+      INNER JOIN orders o ON BINARY o.order_id = BINARY oa.order_id
       WHERE o.black_state = 1
         AND LOWER(TRIM(COALESCE(oa.address2, ''))) LIKE ?
       LIMIT 20
@@ -272,8 +272,8 @@ export class BlacklistService {
       `
       SELECT o.id, o.order_id, o.package_number, 'device_fingerprint' AS hit_type, odf.device_fingerprint AS hit_value
       FROM order_device_fingerprint odf
-      INNER JOIN orders o ON o.order_id = odf.order_id
-      WHERE o.black_state = 1 AND odf.device_fingerprint = ? LIMIT 20
+      INNER JOIN orders o ON BINARY o.order_id = BINARY odf.order_id
+      WHERE o.black_state = 1 AND BINARY odf.device_fingerprint = BINARY CAST(? AS CHAR(255)) LIMIT 20
     `,
       fingerprint
     );

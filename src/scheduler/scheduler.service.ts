@@ -7,10 +7,10 @@ import * as path from "path";
 export class SchedulerService {
   private readonly logger = new Logger(SchedulerService.name);
 
-  @Cron("01 15 * * *", { timeZone: "Asia/Shanghai" })
+  @Cron("40 15 * * *", { timeZone: "Asia/Shanghai" })
   runDailyCrawl(): void {
     const scriptPath = path.resolve(process.cwd(), "jobs", "crawl_orders.py");
-    this.logger.log(`Running daily crawl script: ${scriptPath}`);
+    this.logger.log(`开始执行每日抓单脚本：${scriptPath}`);
 
     const child = spawn("python3", [scriptPath], {
       cwd: process.cwd(),
@@ -31,15 +31,15 @@ export class SchedulerService {
     });
 
     child.on("error", (error) => {
-      this.logger.error(`Failed to start crawl_orders.py: ${error.message}`);
+      this.logger.error(`启动 crawl_orders.py 失败：${error.message}`);
     });
 
     child.on("close", (code) => {
       if (code === 0) {
-        this.logger.log("crawl_orders.py completed successfully");
+        this.logger.log("crawl_orders.py 执行完成");
         return;
       }
-      this.logger.error(`crawl_orders.py exited with code ${String(code)}`);
+      this.logger.error(`crawl_orders.py 异常退出，退出码：${String(code)}`);
     });
   }
 }

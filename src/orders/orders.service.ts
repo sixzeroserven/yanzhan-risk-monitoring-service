@@ -8,11 +8,11 @@ export class OrdersService {
 
   async saveOrder(body: Record<string, unknown>) {
     const orderId = safeString(body.order_id || body.id || body.orderId);
-    if (!orderId) throw new BadRequestException("order_id is required");
+    if (!orderId) throw new BadRequestException("缺少必填参数：order_id");
 
     const deviceFingerprint = safeString(body.device_fingerprint || body.fingerprint || body.deviceFingerprint);
     if (!deviceFingerprint) {
-      throw new BadRequestException("device_fingerprint is required");
+      throw new BadRequestException("缺少必填参数：device_fingerprint");
     }
 
     // saveOrder now only maintains the order-device fingerprint mapping.

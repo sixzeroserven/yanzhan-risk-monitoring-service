@@ -1,4 +1,5 @@
 import { BadRequestException, Injectable, Logger, OnModuleInit } from "@nestjs/common";
+import { AxiosInstance } from "axios";
 import axios from "axios";
 import * as crypto from "crypto";
 import * as https from "https";
@@ -7,39 +8,85 @@ import { EnvConfig } from "../common/config/env.config";
 @Injectable()
 export class ShoplazzaService implements OnModuleInit {
   private readonly logger = new Logger(ShoplazzaService.name);
+  private readonly noteSuccessMarkers = ["Blacklist matched.", "黑名单拦截"];
   constructor(private readonly env: EnvConfig) {}
 
   async onModuleInit(): Promise<void> {
-    if (!this.env.shoplazza.autoSubscribeWebhook) return;
-    try {
-      const result = await this.subscribeOrderUpdateWebhook();
-      this.logger.log(
-        `自动订阅 Shoplazza webhook 成功：event=${result.topic} callback=${result.callback_url}`
-      );
-    } catch (error) {
-      this.logger.error(
-        `自动订阅 Shoplazza webhook 失败：${this.formatAxiosError(error)}`
-      );
+    if (!this.env.shoplazzaGlobal.autoSubscribeWebhook) return;
+    for (const store of this.env.shoplazzaStores) {
+      try {
+        const result = await this.ensureOrderUpdateWebhook(store.storeDomain);
+        this.logger.log(
+          `自动订阅 Shoplazza webhook 成功：store=${store.storeDomain} event=${result.topic} callback=${result.callback_url}`
+        );
+      } catch (error) {
+        if (this.isTopicAlreadyExistsError(error)) {
+          this.logger.log(
+            `自动订阅 Shoplazza webhook 跳过：store=${store.storeDomain} topic=orders/update（已存在相同订阅）`
+          );
+          continue;
+        }
+        this.logger.error(
+          `自动订阅 Shoplazza webhook 失败：store=${store.storeDomain} topic=orders/update ${this.formatAxiosError(error)}`
+        );
+      }
     }
   }
 
-  verifyWebhookSignature(rawBody: Buffer, providedHmac?: string): boolean {
-    if (!providedHmac || !rawBody) return false;
-    const digest = crypto
-      .createHmac("sha256", this.env.shoplazza.webhookSecret)
-      .update(rawBody)
-      .digest("base64");
-    const received = Buffer.from(providedHmac, "utf8");
-    const expected = Buffer.from(digest, "utf8");
-    if (received.length !== expected.length) return false;
-    return crypto.timingSafeEqual(received, expected);
+  private async ensureOrderUpdateWebhook(storeDomain: string) {
+    const expectedAddress = this.resolveCallbackUrl("orders/update");
+    const listed = await this.listWebhooks(storeDomain);
+    const existing = listed.records.find((item) => item.topic === "orders/update");
+    if (existing && existing.address.trim() === expectedAddress.trim()) {
+      return {
+        success: true,
+        topic: "orders/update",
+        callback_url: existing.address,
+        api_path: listed.api_path,
+        data: existing
+      };
+    }
+
+    // Topic exists but callback is stale/invalid: remove and recreate.
+    if (existing?.id) {
+      await this.client(storeDomain).delete(`${listed.api_path}/${encodeURIComponent(existing.id)}`);
+      this.logger.warn(
+        `检测到 webhook 回调地址不匹配，已删除旧订阅：store=${storeDomain} topic=orders/update old=${existing.address} expected=${expectedAddress}`
+      );
+    }
+    return this.subscribeOrderWebhook("orders/update", expectedAddress, storeDomain);
   }
 
-  async cancelOrder(orderId: string | number, reason = "fraud"): Promise<void> {
-    await this.client.post(this.path(this.env.shoplazza.cancelOrderPathTemplate, orderId), { reason });
+  verifyWebhookSignature(rawBody: Buffer, providedHmac?: string, storeDomain?: string): boolean {
+    return !!this.resolveVerifiedStoreDomain(rawBody, providedHmac, storeDomain);
   }
 
-  async appendOrderNote(orderId: string | number, note: string): Promise<void> {
+  resolveVerifiedStoreDomain(rawBody: Buffer, providedHmac?: string, storeDomain?: string): string | undefined {
+    if (!providedHmac || !rawBody) return undefined;
+    const preferredStore = this.env.findShoplazzaStore(storeDomain);
+    if (this.verifyHmacBySecret(rawBody, providedHmac, preferredStore.webhookSecret)) {
+      return preferredStore.storeDomain;
+    }
+
+    // Compatibility fallback: some webhook payloads/headers may not expose stable store domain.
+    for (const store of this.env.shoplazzaStores) {
+      if (store.storeDomain === preferredStore.storeDomain) continue;
+      if (this.verifyHmacBySecret(rawBody, providedHmac, store.webhookSecret)) {
+        this.logger.warn(
+          `Webhook 验签已通过回退匹配：requestedStore=${storeDomain || "-"} matchedStore=${store.storeDomain}`
+        );
+        return store.storeDomain;
+      }
+    }
+    return undefined;
+  }
+
+  async cancelOrder(orderId: string | number, reason = "fraud", storeDomain?: string): Promise<void> {
+    await this.client(storeDomain).post(this.path(this.env.shoplazzaGlobal.cancelOrderPathTemplate, orderId), { reason });
+  }
+
+  async appendOrderNote(orderId: string | number, note: string, storeDomain?: string): Promise<void> {
+    const client = this.client(storeDomain);
     const paths = this.getOrderWritePaths(orderId);
     const payloads: Array<Record<string, unknown>> = [
       { order: { id: orderId, note } },
@@ -52,15 +99,15 @@ export class ShoplazzaService implements OnModuleInit {
     for (const path of paths) {
       for (const payload of payloads) {
         try {
-          await this.client.put(path, payload);
-          const readback = await this.getOrderReadback(orderId);
+          await client.put(path, payload);
+          const readback = await this.getOrderReadback(orderId, storeDomain);
           const savedNote = this.pickFirstString(
             readback.order.note,
             readback.order.order_note,
             readback.order.customer_note,
             readback.order.memo
           );
-          if (savedNote.includes("Blacklist matched.")) {
+          if (this.hasBlacklistNoteMarker(savedNote)) {
             this.logger.log(
               `订单备注写入成功：orderId=${String(orderId)} writePath=${path} readPath=${readback.usedPath}`
             );
@@ -79,16 +126,17 @@ export class ShoplazzaService implements OnModuleInit {
     throw new Error("备注写入失败：未知错误");
   }
 
-  async getOrderReadback(orderId: string | number): Promise<{
+  async getOrderReadback(orderId: string | number, storeDomain?: string): Promise<{
     order: Record<string, unknown>;
     usedPath: string;
     raw: Record<string, unknown>;
   }> {
+    const client = this.client(storeDomain);
     const paths = this.getOrderReadPaths(orderId);
     let lastError: unknown;
     for (const path of paths) {
       try {
-        const resp = await this.client.get(path);
+        const resp = await client.get(path);
         const data = resp.data as Record<string, unknown>;
         const order = this.pickOrderObject(data);
         if (Object.keys(order).length > 0) {
@@ -102,11 +150,16 @@ export class ShoplazzaService implements OnModuleInit {
     return { order: {}, usedPath: "", raw: {} };
   }
 
-  async subscribeOrderUpdateWebhook(callbackUrl?: string) {
-    return this.subscribeOrderWebhook("orders/update", callbackUrl);
+  async subscribeOrderUpdateWebhook(callbackUrl?: string, storeDomain?: string) {
+    return this.subscribeOrderWebhook("orders/update", callbackUrl, storeDomain);
   }
 
-  async subscribeOrderWebhook(topic: string, callbackUrl?: string) {
+  async subscribeOrderCreateWebhook(callbackUrl?: string, storeDomain?: string) {
+    return this.subscribeOrderWebhook("orders/create", callbackUrl, storeDomain);
+  }
+
+  async subscribeOrderWebhook(topic: string, callbackUrl?: string, storeDomain?: string) {
+    const client = this.client(storeDomain);
     const address = this.resolveCallbackUrl(topic, callbackUrl);
     if (!address) {
       throw new BadRequestException(
@@ -114,13 +167,13 @@ export class ShoplazzaService implements OnModuleInit {
       );
     }
 
-    const path = this.env.shoplazza.subscribeWebhookPathTemplate.replace(
+    const path = this.env.shoplazzaGlobal.subscribeWebhookPathTemplate.replace(
       "{version}",
-      encodeURIComponent(this.env.shoplazza.apiVersion)
+      encodeURIComponent(this.env.shoplazzaGlobal.apiVersion)
     );
     const payload = this.buildSubscribePayload(path, address, topic);
     try {
-      const resp = await this.client.post(path, payload);
+      const resp = await client.post(path, payload);
       return {
         success: true,
         topic,
@@ -135,7 +188,7 @@ export class ShoplazzaService implements OnModuleInit {
           `Webhook 订阅路径不存在：${path}，将使用回退路径重试：${fallbackPath}`
         );
         const fallbackPayload = this.buildSubscribePayload(fallbackPath, address, topic);
-        const fallbackResp = await this.client.post(fallbackPath, fallbackPayload);
+        const fallbackResp = await client.post(fallbackPath, fallbackPayload);
         return {
           success: true,
           topic,
@@ -151,16 +204,18 @@ export class ShoplazzaService implements OnModuleInit {
     }
   }
 
-  async listWebhooks() {
+  async listWebhooks(storeDomain?: string) {
+    const client = this.client(storeDomain);
     const path = this.getWebhookCollectionPath();
-    const resp = await this.client.get(path);
+    const resp = await client.get(path);
     const records = this.normalizeWebhookList(resp.data);
     return { api_path: path, count: records.length, records };
   }
 
-  async cleanupWebhooks(keepTopics: string[] = ["orders/update"]) {
+  async cleanupWebhooks(keepTopics: string[] = ["orders/update"], storeDomain?: string) {
+    const client = this.client(storeDomain);
     const keep = new Set(keepTopics.map((item) => item.trim()).filter(Boolean));
-    const listed = await this.listWebhooks();
+    const listed = await this.listWebhooks(storeDomain);
     const removed: Array<{ id: string; topic: string }> = [];
     const kept: Array<{ id: string; topic: string }> = [];
 
@@ -169,7 +224,7 @@ export class ShoplazzaService implements OnModuleInit {
         kept.push({ id: item.id || "-", topic: item.topic || "-" });
         continue;
       }
-      await this.client.delete(`${listed.api_path}/${encodeURIComponent(item.id)}`);
+      await client.delete(`${listed.api_path}/${encodeURIComponent(item.id)}`);
       removed.push({ id: item.id, topic: item.topic });
     }
 
@@ -183,20 +238,21 @@ export class ShoplazzaService implements OnModuleInit {
     };
   }
 
-  private get client() {
-    const httpsAgent = this.env.shoplazza.insecureTls
+  private client(storeDomain?: string): AxiosInstance {
+    const store = this.env.findShoplazzaStore(storeDomain);
+    const httpsAgent = this.env.shoplazzaGlobal.insecureTls
       ? new https.Agent({ rejectUnauthorized: false })
       : undefined;
 
     return axios.create({
-      baseURL: `https://${this.env.shoplazza.storeDomain}`,
-      timeout: this.env.shoplazza.timeoutMs,
+      baseURL: `https://${store.storeDomain}`,
+      timeout: this.env.shoplazzaGlobal.timeoutMs,
       httpsAgent,
       headers: {
         "Content-Type": "application/json",
         // Keep both header variants for compatibility across Shoplazza API versions.
-        "X-Shoplazza-Access-Token": this.env.shoplazza.adminToken,
-        "access-token": this.env.shoplazza.adminToken
+        "X-Shoplazza-Access-Token": store.adminToken,
+        "access-token": store.adminToken
       }
     });
   }
@@ -212,7 +268,7 @@ export class ShoplazzaService implements OnModuleInit {
   }
 
   private getOrderReadPaths(orderId: string | number): string[] {
-    const primary = this.path(this.env.shoplazza.updateOrderPathTemplate, orderId);
+    const primary = this.path(this.env.shoplazzaGlobal.updateOrderPathTemplate, orderId);
     const variants = new Set<string>([primary]);
 
     if (!primary.endsWith(".json")) variants.add(`${primary}.json`);
@@ -229,7 +285,7 @@ export class ShoplazzaService implements OnModuleInit {
   }
 
   private getOrderWritePaths(orderId: string | number): string[] {
-    const primary = this.path(this.env.shoplazza.updateOrderPathTemplate, orderId);
+    const primary = this.path(this.env.shoplazzaGlobal.updateOrderPathTemplate, orderId);
     const variants = new Set<string>([primary]);
 
     if (!primary.endsWith(".json")) variants.add(`${primary}.json`);
@@ -272,9 +328,9 @@ export class ShoplazzaService implements OnModuleInit {
   }
 
   private getWebhookCollectionPath(): string {
-    const path = this.env.shoplazza.subscribeWebhookPathTemplate.replace(
+    const path = this.env.shoplazzaGlobal.subscribeWebhookPathTemplate.replace(
       "{version}",
-      encodeURIComponent(this.env.shoplazza.apiVersion)
+      encodeURIComponent(this.env.shoplazzaGlobal.apiVersion)
     );
     if (path.endsWith("/webhooks/subscribe")) {
       return path.replace(/\/webhooks\/subscribe$/, "/webhooks");
@@ -334,7 +390,7 @@ export class ShoplazzaService implements OnModuleInit {
     const explicit = (callbackUrl || "").trim();
     if (explicit) return explicit;
 
-    const base = (this.env.shoplazza.webhookCallbackUrl || "").trim();
+    const base = (this.env.shoplazzaGlobal.webhookCallbackUrl || "").trim();
     if (!base) return "";
 
     const suffix = topic.split("/")[1] || "update";
@@ -353,11 +409,44 @@ export class ShoplazzaService implements OnModuleInit {
 
     const status = error.response?.status;
     const statusText = error.response?.statusText;
-    const method = error.config?.method?.toUpperCase() || "UNKNOWN";
-    const url = error.config?.url || "UNKNOWN_URL";
+    const method = error.config?.method?.toUpperCase() || "未知方法";
+    const url = error.config?.url || "未知地址";
     const responseData =
       error.response?.data === undefined ? "" : ` response=${JSON.stringify(error.response.data)}`;
 
-    return `${method} ${url} -> ${status || "NO_STATUS"} ${statusText || ""} ${error.message}${responseData}`.trim();
+    return `${method} ${url} -> ${status || "无状态码"} ${statusText || ""} ${error.message}${responseData}`.trim();
+  }
+
+  private isTopicAlreadyExistsError(error: unknown): boolean {
+    const text = this.extractErrorText(error).toLowerCase();
+    if (!text.includes("topic already exists")) return false;
+
+    // Prefer strict check when status is available.
+    if (axios.isAxiosError(error)) {
+      return error.response?.status === 422;
+    }
+    return text.includes("422") || text.includes("unprocessable entity");
+  }
+
+  private extractErrorText(error: unknown): string {
+    if (axios.isAxiosError(error)) {
+      const responseData =
+        error.response?.data === undefined ? "" : ` ${JSON.stringify(error.response.data)}`;
+      return `${error.message}${responseData}`;
+    }
+    if (error instanceof Error) return error.message;
+    return String(error);
+  }
+
+  private verifyHmacBySecret(rawBody: Buffer, providedHmac: string, secret: string): boolean {
+    const digest = crypto.createHmac("sha256", secret).update(rawBody).digest("base64");
+    const received = Buffer.from(providedHmac, "utf8");
+    const expected = Buffer.from(digest, "utf8");
+    if (received.length !== expected.length) return false;
+    return crypto.timingSafeEqual(received, expected);
+  }
+
+  private hasBlacklistNoteMarker(note: string): boolean {
+    return this.noteSuccessMarkers.some((marker) => note.includes(marker));
   }
 }

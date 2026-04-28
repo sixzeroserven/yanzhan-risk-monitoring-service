@@ -30,6 +30,6 @@ async function bootstrap(): Promise<void> {
 }
 
 bootstrap().catch((error) => {
-  console.error("Failed to bootstrap application", error);
+  console.error("应用启动失败", error);
   process.exit(1);
 });

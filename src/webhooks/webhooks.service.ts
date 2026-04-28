@@ -9,23 +9,32 @@ import { extractRiskIdentity } from "./webhook-order.util";
 export class WebhooksService {
   private readonly logger = new Logger(WebhooksService.name);
   private readonly lastRiskFingerprint = new Map<string, string>();
+  private readonly noteSuccessMarkers = ["Blacklist matched.", "黑名单拦截"];
 
   constructor(
     private readonly blacklistService: BlacklistService,
     private readonly shoplazzaService: ShoplazzaService
   ) {}
 
-  async processOrderUpdate(order: Record<string, unknown>) {
-    const orderId = (order.id || order.order_id || order.order_number) as string | number;
+  async processOrderUpdate(order: Record<string, unknown>, storeDomain?: string) {
+   // console.log("processOrderUpdate======---", order);
+    const orderId = (
+      order.order_id ||
+      order.id ||
+      order.source_id ||
+      order.order_number ||
+      order.number
+    ) as string | number;
     if (!orderId) throw new BadRequestException("Webhook 载荷缺少订单号");
     const orderIdText = String(orderId);
+    const scopedOrderId = `${String(storeDomain || "default").toLowerCase()}::${orderIdText}`;
     const fingerprint = this.buildRiskFingerprint(order);
-    const previousFingerprint = this.lastRiskFingerprint.get(orderIdText);
+    const previousFingerprint = this.lastRiskFingerprint.get(scopedOrderId);
     if (previousFingerprint === fingerprint) {
       this.logger.log(`订单信息未变化，跳过黑名单校验：orderId=${orderIdText}`);
       return { skipped: true, blocked: false, orderId };
     }
-    this.lastRiskFingerprint.set(orderIdText, fingerprint);
+    this.lastRiskFingerprint.set(scopedOrderId, fingerprint);
 
     const result = await this.blacklistService.checkByOrder(order);
     const hitTypes = [...new Set(result.hits.map((item: { hit_type: string }) => item.hit_type))];
@@ -37,25 +46,25 @@ export class WebhooksService {
       `命中黑名单：orderId=${orderIdText} hitCount=${String(result.hits.length)} hitTypes=${hitTypes.join(",") || "none"} email=${result.contact.email || "-"} phone=${result.contact.phoneNumber || "-"} fingerprint=${result.contact.fingerprint || "-"}`
     );
 
-    const note = `Blacklist matched. Hit rules: ${hitTypes.join(", ")}. User has been marked as blacklisted.`;
+    const note = `⚠️【黑名单拦截】命中规则：${hitTypes.join("、")}。该用户被识别为黑名单，请谨慎处理！`;
 
     let noteUpdated = true;
     let noteConfirmed = false;
     try {
-      const currentReadback = await this.shoplazzaService.getOrderReadback(orderId);
+      const currentReadback = await this.shoplazzaService.getOrderReadback(orderId, storeDomain);
       const existingNote = this.pickFirstString(
         currentReadback.order?.note,
         currentReadback.order?.order_note,
         currentReadback.order?.customer_note,
         currentReadback.order?.memo
       );
-      if (existingNote.includes("Blacklist matched.")) {
+      if (this.hasBlacklistNoteMarker(existingNote)) {
         noteConfirmed = true;
         this.logger.log(`备注已存在，跳过重复写入：orderId=${orderIdText}`);
       } else {
-      await this.shoplazzaService.appendOrderNote(orderId, note);
+      await this.shoplazzaService.appendOrderNote(orderId, note, storeDomain);
       try {
-        const readback = await this.shoplazzaService.getOrderReadback(orderId);
+        const readback = await this.shoplazzaService.getOrderReadback(orderId, storeDomain);
         const latestOrder = readback.order;
         const savedNote = this.pickFirstString(
           latestOrder?.note,
@@ -63,7 +72,7 @@ export class WebhooksService {
           latestOrder?.customer_note,
           latestOrder?.memo
         );
-        noteConfirmed = savedNote.includes("Blacklist matched.");
+        noteConfirmed = this.hasBlacklistNoteMarker(savedNote);
         const rawKeys = Object.keys(readback.raw || {}).join(",") || "-";
         const orderKeys = Object.keys(latestOrder || {}).join(",") || "-";
         this.logger.log(
@@ -114,11 +123,15 @@ export class WebhooksService {
 
     const status = error.response?.status;
     const statusText = error.response?.statusText;
-    const method = error.config?.method?.toUpperCase() || "UNKNOWN";
-    const url = error.config?.url || "UNKNOWN_URL";
+    const method = error.config?.method?.toUpperCase() || "未知方法";
+    const url = error.config?.url || "未知地址";
     const responseData =
       error.response?.data === undefined ? "" : ` response=${JSON.stringify(error.response.data)}`;
 
-    return `${method} ${url} -> ${status || "NO_STATUS"} ${statusText || ""} ${error.message}${responseData}`.trim();
+    return `${method} ${url} -> ${status || "无状态码"} ${statusText || ""} ${error.message}${responseData}`.trim();
+  }
+
+  private hasBlacklistNoteMarker(note: string): boolean {
+    return this.noteSuccessMarkers.some((marker) => note.includes(marker));
   }
 }
