@@ -2,29 +2,51 @@
 
 set -euo pipefail
 
-if [[ $# -lt 3 ]]; then
-  echo "用法: $0 <ssh_user> <vm_ip> <remote_dir> [ssh_key_path] [--run-db-push]"
-  echo "示例: $0 azureuser 20.1.2.3 /home/azureuser/shoplazza-blacklist-service ~/.ssh/id_rsa"
-  echo "示例(危险): $0 azureuser 20.1.2.3 /home/azureuser/shoplazza-blacklist-service ~/.ssh/id_rsa --run-db-push"
+# Optional local defaults file (do not commit your secrets).
+DEFAULTS_FILE="./scripts/azure-vm-deploy.local.env"
+if [[ -f "${DEFAULTS_FILE}" ]]; then
+  # shellcheck disable=SC1090
+  source "${DEFAULTS_FILE}"
+fi
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  echo "用法: $0 [ssh_user] [vm_ip] [remote_dir] [ssh_key_path] [--run-db-push]"
+  echo "支持通过环境变量或 ${DEFAULTS_FILE} 提供默认值："
+  echo "  DEPLOY_SSH_USER, DEPLOY_VM_IP, DEPLOY_REMOTE_DIR, DEPLOY_SSH_KEY_PATH"
+  echo "示例(最短): DEPLOY_SSH_USER=azureuser DEPLOY_VM_IP=20.1.2.3 DEPLOY_REMOTE_DIR=/home/azureuser/shoplazza-blacklist-service DEPLOY_SSH_KEY_PATH=~/.ssh/id_rsa $0"
+  echo "示例(危险): $0 --run-db-push"
+  exit 0
+fi
+
+RUN_DB_PUSH="false"
+POSITIONAL_ARGS=()
+for arg in "$@"; do
+  if [[ "${arg}" == "--run-db-push" ]]; then
+    RUN_DB_PUSH="true"
+  else
+    POSITIONAL_ARGS+=("${arg}")
+  fi
+done
+
+SSH_USER="${POSITIONAL_ARGS[0]:-${DEPLOY_SSH_USER:-}}"
+VM_IP="${POSITIONAL_ARGS[1]:-${DEPLOY_VM_IP:-}}"
+REMOTE_DIR="${POSITIONAL_ARGS[2]:-${DEPLOY_REMOTE_DIR:-}}"
+SSH_KEY_PATH="${POSITIONAL_ARGS[3]:-${DEPLOY_SSH_KEY_PATH:-}}"
+
+if [[ -z "${SSH_USER}" || -z "${VM_IP}" || -z "${REMOTE_DIR}" ]]; then
+  echo "缺少参数。"
+  echo "用法: $0 [ssh_user] [vm_ip] [remote_dir] [ssh_key_path] [--run-db-push]"
+  echo "你也可以先 export DEPLOY_SSH_USER / DEPLOY_VM_IP / DEPLOY_REMOTE_DIR / DEPLOY_SSH_KEY_PATH"
   exit 1
 fi
 
-SSH_USER="$1"
-VM_IP="$2"
-REMOTE_DIR="$3"
-SSH_KEY_PATH="${4:-}"
-DB_MODE_FLAG="${5:-}"
-RUN_DB_PUSH="false"
-
-if [[ "${SSH_KEY_PATH}" == "--run-db-push" ]]; then
-  RUN_DB_PUSH="true"
-  SSH_KEY_PATH=""
-elif [[ "${DB_MODE_FLAG}" == "--run-db-push" ]]; then
-  RUN_DB_PUSH="true"
-elif [[ -n "${DB_MODE_FLAG}" ]]; then
-  echo "未知参数: ${DB_MODE_FLAG}"
-  echo "仅支持可选参数 --run-db-push"
+if [[ ${#POSITIONAL_ARGS[@]} -gt 4 ]]; then
+  echo "参数过多，仅支持 [ssh_user] [vm_ip] [remote_dir] [ssh_key_path] [--run-db-push]"
   exit 1
+fi
+
+if [[ "${SSH_KEY_PATH}" == "~/"* ]]; then
+  SSH_KEY_PATH="${SSH_KEY_PATH/#\~/$HOME}"
 fi
 
 if [[ ! -f ".env" ]]; then

@@ -8,7 +8,6 @@ import { EnvConfig } from "../common/config/env.config";
 @Injectable()
 export class ShoplazzaService implements OnModuleInit {
   private readonly logger = new Logger(ShoplazzaService.name);
-  private readonly noteSuccessMarkers = ["Blacklist matched.", "黑名单拦截"];
   constructor(private readonly env: EnvConfig) {}
 
   async onModuleInit(): Promise<void> {
@@ -107,9 +106,9 @@ export class ShoplazzaService implements OnModuleInit {
             readback.order.customer_note,
             readback.order.memo
           );
-          if (this.hasBlacklistNoteMarker(savedNote)) {
+          if (this.hasNoteText(savedNote, note)) {
             this.logger.log(
-              `订单备注写入成功：orderId=${String(orderId)} writePath=${path} readPath=${readback.usedPath}`
+              `订单备注写入成功：orderId=${String(orderId)}`
             );
             return;
           }
@@ -446,7 +445,8 @@ export class ShoplazzaService implements OnModuleInit {
     return crypto.timingSafeEqual(received, expected);
   }
 
-  private hasBlacklistNoteMarker(note: string): boolean {
-    return this.noteSuccessMarkers.some((marker) => note.includes(marker));
+  private hasNoteText(existingNote: string, expectedNote: string): boolean {
+    if (!existingNote || !expectedNote) return false;
+    return existingNote.includes(expectedNote);
   }
 }

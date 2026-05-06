@@ -30,6 +30,7 @@ model OrderAddress {
 model Order {
   id            Int       @id @default(autoincrement())
   orderId       String    @map("order_id") @db.VarChar(100)
+  transactionId String?   @map("transaction_id") @db.VarChar(100)
   packageNumber String    @map("package_number") @db.VarChar(100)
   buyerName     String?   @map("buyer_name") @db.VarChar(200)
   contactName   String?   @map("contact_name") @db.VarChar(200)

@@ -7,7 +7,7 @@ import * as path from "path";
 export class SchedulerService {
   private readonly logger = new Logger(SchedulerService.name);
 
-  @Cron("40 15 * * *", { timeZone: "Asia/Shanghai" })
+  @Cron("12 14 * * *", { timeZone: "Asia/Shanghai" })
   runDailyCrawl(): void {
     const scriptPath = path.resolve(process.cwd(), "jobs", "crawl_orders.py");
     this.logger.log(`开始执行每日抓单脚本：${scriptPath}`);

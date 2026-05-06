@@ -29,17 +29,23 @@ MYSQL_CONFIG = {
 
 API_URL = "https://www.dianxiaomi.com/api/package/advancedSearch.json"
 
-# 请求头（Cookie 需定期更新）
-HEADERS = {
-    "accept": "application/json, text/plain, */*",
-    "accept-language": "zh-CN,zh;q=0.9",
-    "content-type": "application/x-www-form-urlencoded",
-    "origin": "https://www.dianxiaomi.com",
-    "referer": "https://www.dianxiaomi.com/web/order/all?go=m1-1",
-    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-    "bx-v": "2.5.11",
-    "cookie": "MYJ_MKTG_fapsc5t4tc=JTdCJTdE; dxm_i=MjQ5MTg0MCFhVDB5TkRreE9EUXchNWIwMDdmODZiYjM4N2Y4NTI0ZmVmYjNkZTRmMDUyZjc; dxm_t=MTc3NjEyOTEyOSFkRDB4TnpjMk1USTVNVEk1IWQ5YjU5Nzc2NDg0OGU0MGZhZTllNmYwZGJkMDdjMGE1; dxm_c=YTRuckdOdjQhWXoxaE5HNXlSMDUyTkEhYjEyMTY4ZTQxM2Y5NTI0Yjc3MWExYmEwNmUzMGJmMDY; dxm_w=JDJhJDEwJGh1bGpOamJ1MEEzLkQvZmplQkdmTk83R2lFazVpU05PMEx5NTdrZEVTMmJvODhQZjZmaXRTIWR6MGtNbUVrTVRBa2FIVnNhazVxWW5Vd1FUTXVSQzltYW1WQ1IyWk9UemRIYVVWck5XbFRUazh3VEhrMU4ydGtSVk15WW04NE9GQm1ObVpwZEZNITk2NzVlNzQzNmE5NGZhMzAyZmRlNGYzNDJjMjIzNzM5; dxm_s=cND4-SUm3qWD4Z7x6t3BbdzvQHDaQoFAA2mCLh-eLC0; Hm_lvt_f8001a3f3d9bf5923f780580eb550c0b=1776044008,1776332961; HMACCOUNT=EF1250AAB9E8FECD; MYJ_fapsc5t4tc=JTdCJTIyZGV2aWNlSWQlMjIlM0ElMjJiMjMwOTYwYy1iNTAzLTQxZjQtODMxMi1mNjc3MDViNTQyNGIlMjIlMkMlMjJ1c2VySWQlMjIlM0ElMjIyNDkxODQwJTIyJTJDJTIycGFyZW50SWQlMjIlM0ElMjI3MzUzMzclMjIlMkMlMjJzZXNzaW9uSWQlMjIlM0ExNzc2Njc0MjU1NDA2JTJDJTIyb3B0T3V0JTIyJTNBZmFsc2UlMkMlMjJsYXN0RXZlbnRJZCUyMiUzQTAlN0Q=; Hm_lpvt_f8001a3f3d9bf5923f780580eb550c0b=1776674256; JSESSIONID=19D17EF5D6914770418142BB2952132F; tfstk=gKBmxBx-QUgILr0zKVJbwrImUbFRZK96uNH9WdLaaU8SkqHAbh2GWa3ODS9AIRYl5Edv3xHMsU7WXOEX6avGPa7M1oT97FbObsE8pJIfcd9NjyeLpDSk_dQmuF8abb-HvuK4XkCFFd9aJzhy3_jeCZfRyz-V4ux9XmlN7h-yUH8ybjJN7URyYH32Qd7aqQ-XYxkqgFlrzhYy7dJN7LoyXU-2QI7N4ux6zFlKyj8dQ6Wz8lTohX7q91tDieS2uiIAUmdSGGYlciBPZgVGmUq82TxDieRij-RFKMSVdhX_YfYGAs7vVN23rLWcotRkIRDWHMfPoQf0SYA5aM6wZ_anOMsVo6RF38qyZtsp3UX_fATVMGW9stzEXEWfkTACCq4JW6IR3QbUyYb6ss5e3O43UgztaXy78AtzXTls1I-WqeK4on4VkqqK6uqo9GO2VHTdBuckcI-W0hquqXw9g3thR"
-}
+
+def dianxiaomi_request_headers() -> Dict[str, Any]:
+    """Cookie 来自环境变量 DIANXIAOMI_COOKIE（与浏览器里请求一致，需定期更新）。"""
+    cookie = os.getenv("DIANXIAOMI_COOKIE", "").strip()
+    if not cookie:
+        logger.error("请配置环境变量 DIANXIAOMI_COOKIE（可在项目根目录 .env 中设置）")
+        raise SystemExit(1)
+    return {
+        "accept": "application/json, text/plain, */*",
+        "accept-language": "zh-CN,zh;q=0.9",
+        "content-type": "application/x-www-form-urlencoded",
+        "origin": "https://www.dianxiaomi.com",
+        "referer": "https://www.dianxiaomi.com/web/order/all?go=m1-1",
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+        "bx-v": "2.5.11",
+        "cookie": cookie,
+    }
 
 # POST 请求体公共部分
 BASE_PAYLOAD = {
@@ -322,7 +328,7 @@ def fetch_orders_page(page_no: int, payload_template: Dict[str, Any]) -> Tuple[L
 
     for attempt in range(MAX_RETRIES):
         try:
-            resp = requests.post(API_URL, headers=HEADERS, data=payload, timeout=30)
+            resp = requests.post(API_URL, headers=dianxiaomi_request_headers(), data=payload, timeout=30)
             resp.raise_for_status()
             data = resp.json()
             if data.get('code') != 0:

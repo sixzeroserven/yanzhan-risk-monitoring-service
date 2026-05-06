@@ -22,11 +22,11 @@ async function bootstrap(): Promise<void> {
   await app.listen(env.port, "0.0.0.0");
 
   console.log(`\nService started successfully.`);
-  console.log(`- Local API: http://localhost:${env.port}`);
-  console.log(`- Health: http://localhost:${env.port}/health`);
+  // console.log(`- Local API: http://localhost:${env.port}`);
+  // console.log(`- Health: http://localhost:${env.port}/health`);
   console.log(`- Swagger UI: http://localhost:${env.port}/docs`);
-  console.log(`- Blacklist check: POST http://localhost:${env.port}/api/blacklist/check`);
-  console.log(`- Save order: POST http://localhost:${env.port}/api/orders/save\n`);
+  // console.log(`- Blacklist check: POST http://localhost:${env.port}/api/blacklist/check`);
+  // console.log(`- Save order: POST http://localhost:${env.port}/api/orders/save\n`);
 }
 
 bootstrap().catch((error) => {

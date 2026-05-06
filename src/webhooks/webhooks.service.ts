@@ -9,8 +9,6 @@ import { extractRiskIdentity } from "./webhook-order.util";
 export class WebhooksService {
   private readonly logger = new Logger(WebhooksService.name);
   private readonly lastRiskFingerprint = new Map<string, string>();
-  private readonly noteSuccessMarkers = ["Blacklist matched.", "黑名单拦截"];
-
   constructor(
     private readonly blacklistService: BlacklistService,
     private readonly shoplazzaService: ShoplazzaService
@@ -58,7 +56,7 @@ export class WebhooksService {
         currentReadback.order?.customer_note,
         currentReadback.order?.memo
       );
-      if (this.hasBlacklistNoteMarker(existingNote)) {
+      if (this.hasNoteText(existingNote, note)) {
         noteConfirmed = true;
         this.logger.log(`备注已存在，跳过重复写入：orderId=${orderIdText}`);
       } else {
@@ -72,11 +70,11 @@ export class WebhooksService {
           latestOrder?.customer_note,
           latestOrder?.memo
         );
-        noteConfirmed = this.hasBlacklistNoteMarker(savedNote);
+        noteConfirmed = this.hasNoteText(savedNote, note);
         const rawKeys = Object.keys(readback.raw || {}).join(",") || "-";
         const orderKeys = Object.keys(latestOrder || {}).join(",") || "-";
         this.logger.log(
-          `备注回读校验：orderId=${orderIdText} noteConfirmed=${String(noteConfirmed)} savedNote=${savedNote || "-"} usedPath=${readback.usedPath || "-"} rawKeys=${rawKeys} orderKeys=${orderKeys}`
+          `备注回读校验：orderId=${orderIdText}`
         );
         if (!noteConfirmed) {
           const rawPreview = JSON.stringify(readback.raw || {}).slice(0, 800);
@@ -131,7 +129,8 @@ export class WebhooksService {
     return `${method} ${url} -> ${status || "无状态码"} ${statusText || ""} ${error.message}${responseData}`.trim();
   }
 
-  private hasBlacklistNoteMarker(note: string): boolean {
-    return this.noteSuccessMarkers.some((marker) => note.includes(marker));
+  private hasNoteText(existingNote: string, expectedNote: string): boolean {
+    if (!existingNote || !expectedNote) return false;
+    return existingNote.includes(expectedNote);
   }
 }

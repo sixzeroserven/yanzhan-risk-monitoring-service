@@ -1,13 +1,13 @@
-# Shoplazza Blacklist Service (NestJS)
+# Shoplazza 黑名单服务（NestJS）
 
-NestJS service using `@Controller` style APIs for:
+基于 NestJS、`@Controller` 风格的接口服务，提供：
 
-- Shoplazza `orders/create` webhook interception
-- blacklist checking API
-- order save API
-- Swagger docs
+- Shoplazza `orders/create` Webhook 拦截与黑名单逻辑  
+- 黑名单校验接口  
+- 订单保存接口  
+- Swagger 文档  
 
-## Project Structure
+## 目录结构
 
 ```text
 src
@@ -42,7 +42,7 @@ src
     └── webhooks.service.ts
 ```
 
-## Run Locally
+## 本地运行
 
 ```bash
 cp .env.example .env
@@ -52,126 +52,125 @@ npm run build
 npm start
 ```
 
-Startup log prints direct URLs:
+启动后可直接访问：
 
 - `http://localhost:3000/health`
 - `http://localhost:3000/docs`
 - `POST http://localhost:3000/api/blacklist/check`
 - `POST http://localhost:3000/api/orders/save`
 
-## Multi-Store Shoplazza Support
+## 多店铺 Shoplazza
 
-By default, the service works with one Shoplazza store using:
+默认使用单个店铺，环境变量：
 
 - `SHOPLAZZA_STORE_DOMAIN`
 - `SHOPLAZZA_ADMIN_TOKEN`
 - `SHOPLAZZA_WEBHOOK_SECRET`
 
-To enable multiple stores, set `SHOPLAZZA_STORES_JSON` in `.env` as a JSON array:
+多店铺时在 `.env` 中设置 `SHOPLAZZA_STORES_JSON`（JSON 数组），例如：
 
 ```bash
 SHOPLAZZA_STORES_JSON=[{"storeDomain":"store-a.myshoplaza.com","adminToken":"token_a","webhookSecret":"secret_a"},{"storeDomain":"store-b.myshoplaza.com","adminToken":"token_b","webhookSecret":"secret_b"}]
 ```
 
-When `SHOPLAZZA_STORES_JSON` is provided, the service selects store config by webhook domain (header or payload), and falls back to the first configured store if missing.
+配置 `SHOPLAZZA_STORES_JSON` 后，服务按 Webhook 里的店铺域名匹配配置；缺失时回退到数组中的第一项。
 
-## API Endpoints
+## 接口说明
 
-- `GET /health`
-- `POST /webhooks/shoplazza/orders/create`
-- `POST /api/blacklist/check` (`@Controller("api/blacklist")`)
-- `POST /api/orders/save` (`@Controller("api/orders")`)
-- `POST /webhooks/shoplazza/orders/create` (`@Controller("webhooks/shoplazza/orders")`)
+- `GET /health`：健康检查  
+- `POST /webhooks/shoplazza/orders/create`：订单创建 Webhook  
+- `POST /api/blacklist/check`：黑名单校验（控制器前缀 `api/blacklist`）  
+- `POST /api/orders/save`：保存订单（控制器前缀 `api/orders`）  
 
-### Webhook Behavior
+### Webhook 行为
 
-When an incoming `orders/create` webhook hits blacklist rules, the service:
+当 `orders/create`（或订单更新流程）命中黑名单规则时，服务会：
 
-- adds an order note in Shoplazza with hit rule types
-- marks the order/customer as blacklisted by upserting `order_address` and `back_list`
-- does **not** cancel the order automatically
+- 在 Shoplazza 订单中追加备注（命中规则类型）  
+- 通过写入 `order_address` 与黑名单相关数据标记风险  
+- **不会**自动取消订单  
 
-### Save Order API
+### 保存订单接口
 
-`POST /api/orders/save` will upsert into `order_address` by `order_id`.
+`POST /api/orders/save` 按 `order_id` 对 `order_address` 做 upsert。  
 
-If `save_blacklist=true`, it will also upsert into `back_list` (requires `package_number`).
+若 `save_blacklist=true`，还会写入黑名单相关表（需提供 `package_number` 等必填字段）。  
 
-## Docker Run
+## Docker 运行
 
 ```bash
 cp .env.docker.example .env
 docker compose up -d --build
 ```
 
-If local MySQL already occupies `3306`, this project maps container MySQL to host `3307`.
+若本机已有服务占用 `3306`，可将 compose 中 MySQL 映射改为例如宿主机的 `3307`（按你本地 `docker-compose.yml` 为准）。  
 
-## Deploy to Azure VM
+## Python 定时任务与凭证
 
-This repository includes two scripts for Azure Virtual Machine deployment:
+- `jobs/crawl_orders.py`：抓取店小秘订单，需在 `.env` 中配置 **`DIANXIAOMI_COOKIE`**（浏览器登录店小秘后复制完整 Cookie）。  
+- `jobs/sync_hipay_transaction_ids.py`：从 Hipay 同步交易号到库表 `transaction_id`，需配置 **`HIPAY_AUTHORIZATION`**（完整 `Bearer …` 字符串）。  
 
-- `scripts/azure-vm-bootstrap.sh`: initialize Docker environment on VM
-- `scripts/azure-vm-deploy.sh`: upload project, run `docker compose up -d --build`, and execute `prisma db push`
+示例变量见 `.env.example` / `.env.docker.example`。容器内执行脚本前请确认同一 `.env` 已包含上述变量（`docker compose` 的 `env_file` 会注入到 `app` 服务）。  
 
-### 1) Create Azure VM
+## 部署到 Azure 虚拟机
 
-- OS: Ubuntu 22.04 LTS
-- Recommended size: 2 vCPU / 4GB RAM or above
-- Open inbound ports: `22`, `80`, `443`
-- Do not open `3000` to public network
+仓库提供两个脚本：
 
-### 2) Prepare local env
+- `scripts/azure-vm-bootstrap.sh`：在虚拟机上初始化 Docker 环境（一次性）  
+- `scripts/azure-vm-deploy.sh`：打包上传项目、执行 `docker compose up -d --build`，并按脚本逻辑处理数据库（如 `prisma db push` 等，以脚本实际内容为准）  
+
+### 1）创建虚拟机
+
+- 系统：Ubuntu 22.04 LTS  
+- 建议规格：2 vCPU / 4GB 内存或以上  
+- 入站端口：`22`、`80`、`443`  
+- **不要**把应用端口 `3000` 直接暴露到公网（由 Nginx 反代）  
+
+### 2）准备本地环境文件
 
 ```bash
 cp .env.docker.example .env
 ```
 
-Edit `.env` with real values (database / multi-store tokens / webhook secrets).
+按实际数据库、多店铺 Token、Webhook 密钥等编辑 `.env`。  
 
-### 3) Initialize VM once
+### 3）初始化虚拟机（首次）
 
 ```bash
 ./scripts/azure-vm-bootstrap.sh <ssh_user> <vm_ip> [ssh_key_path]
 ```
 
-Example:
+示例：
 
 ```bash
 ./scripts/azure-vm-bootstrap.sh azureuser 20.1.2.3 ~/.ssh/id_rsa
 ```
 
-### 4) Deploy app to VM
+### 4）部署应用到虚拟机
 
 ```bash
 ./scripts/azure-vm-deploy.sh <ssh_user> <vm_ip> <remote_dir> [ssh_key_path]
 ```
 
-Example:
+也可配合 `scripts/azure-vm-deploy.local.env` 减少重复参数（脚本支持读取该文件）。  
 
-```bash
-./scripts/azure-vm-deploy.sh azureuser 20.1.2.3 /home/azureuser/shoplazza-blacklist-service ~/.ssh/id_rsa
-```
+### 5）验证
 
-### 5) Verify
+- `http://<vm_ip>/health`  
+- `http://<vm_ip>/docs`  
 
-- `http://<vm_ip>/health`
-- `http://<vm_ip>/docs`
+### 安全说明（暂无独立域名时）
 
-### Security Notes (No Domain Yet)
+- 应用容器仅监听 `127.0.0.1:3000`，由宿主机 Nginx 在 `80` 端口反向代理对外访问。  
+- 网络安全组可保留 `443` 开放，便于后续接入 HTTPS。  
+- 域名就绪后建议使用 Let’s Encrypt（`certbot`）等切换为 HTTPS。  
 
-- App container is bound to `127.0.0.1:3000` only.
-- Public access goes through Nginx on port `80`.
-- Keep `443` open in NSG for future HTTPS migration.
-- When domain is ready, add Let's Encrypt (`certbot`) and switch to HTTPS.
+## 定时任务模块
 
-## Scheduled Job Module
+应用内置 Nest 定时任务，默认每日 **`01:00`** 执行：
 
-The app includes a built-in Nest scheduler module that runs daily at `01:00`:
+- Cron：`0 1 * * *`  
+- 命令：`python3 jobs/crawl_orders.py`  
+- 代码：`src/scheduler/scheduler.service.ts`  
 
-- Cron: `0 1 * * *`
-- Command: `python3 jobs/crawl_orders.py`
-- Scheduler code: `src/scheduler/scheduler.service.ts`
-
-Put your script at:
-
-- `jobs/crawl_orders.py`
+脚本路径：`jobs/crawl_orders.py`（请确保 `.env` 中已配置 **`DIANXIAOMI_COOKIE`**）。  
