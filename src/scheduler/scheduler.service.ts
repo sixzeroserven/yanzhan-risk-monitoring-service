@@ -7,39 +7,50 @@ import * as path from "path";
 export class SchedulerService {
   private readonly logger = new Logger(SchedulerService.name);
 
-  @Cron("12 14 * * *", { timeZone: "Asia/Shanghai" })
+  @Cron("00 18 * * *", { timeZone: "Asia/Shanghai" })
   runDailyCrawl(): void {
-    const scriptPath = path.resolve(process.cwd(), "jobs", "crawl_orders.py");
-    this.logger.log(`开始执行每日抓单脚本：${scriptPath}`);
+    this.runPythonJob("crawl_orders.py");
+  }
+
+  @Cron("30 19 * * *", { timeZone: "Asia/Shanghai" })
+  runDailyHipaySync(): void {
+    this.runPythonJob("sync_hipay_transaction_ids.py");
+  }
+
+  private runPythonJob(scriptFile: string): void {
+    const scriptPath = path.resolve(process.cwd(), "jobs", scriptFile);
+    this.logger.log(`开始执行脚本：${scriptPath}`);
 
     const child = spawn("python3", [scriptPath], {
       cwd: process.cwd(),
       stdio: ["ignore", "pipe", "pipe"]
     });
 
+    const prefix = `[${scriptFile}]`;
+
     child.stdout.on("data", (data: Buffer) => {
-      this.logger.log(`[crawl_orders.py] ${data.toString().trim()}`);
+      this.logger.log(`${prefix} ${data.toString().trim()}`);
     });
 
     child.stderr.on("data", (data: Buffer) => {
       const msg = data.toString().trim();
       if (msg.includes("ERROR") || msg.includes("CRITICAL")) {
-        this.logger.error(`[crawl_orders.py] ${msg}`);
+        this.logger.error(`${prefix} ${msg}`);
       } else {
-        this.logger.log(`[crawl_orders.py] ${msg}`);
+        this.logger.log(`${prefix} ${msg}`);
       }
     });
 
     child.on("error", (error) => {
-      this.logger.error(`启动 crawl_orders.py 失败：${error.message}`);
+      this.logger.error(`启动 ${scriptFile} 失败：${error.message}`);
     });
 
     child.on("close", (code) => {
       if (code === 0) {
-        this.logger.log("crawl_orders.py 执行完成");
+        this.logger.log(`${scriptFile} 执行完成`);
         return;
       }
-      this.logger.error(`crawl_orders.py 异常退出，退出码：${String(code)}`);
+      this.logger.error(`${scriptFile} 异常退出，退出码：${String(code)}`);
     });
   }
 }

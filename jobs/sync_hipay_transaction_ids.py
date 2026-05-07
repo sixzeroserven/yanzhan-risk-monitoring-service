@@ -1,7 +1,8 @@
 """
+脚本用途: 用于定时更新Hipay交易号到数据库（新轮询）
+
 从 Hipay PayOrder 列表分页拉取全部数据：rows 里每条为对象，取 orderAid、orderCid，
 按 orderAid 更新 orders.order_id 对应的 transaction_id（orderCid）。未匹配则跳过、不插新行。
-
 配置与 jobs/crawl_orders.py 一样：库表用 .env 的 DB_*；Hipay 鉴权使用环境变量 HIPAY_AUTHORIZATION（完整 Bearer 串，见 .env.example）。
 
 用法：
