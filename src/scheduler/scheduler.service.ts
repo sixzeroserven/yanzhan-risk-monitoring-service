@@ -17,6 +17,16 @@ export class SchedulerService {
     this.runPythonJob("sync_hipay_transaction_ids.py");
   }
 
+  @Cron("00 20 * * *", { timeZone: "Asia/Shanghai" })
+  runDailyShoplazzaOrderFieldsSync(): void {
+    this.runPythonJob("sync_shoplazza_order_fields.py");
+  }
+
+  @Cron("30 20 * * *", { timeZone: "Asia/Shanghai" })
+  runDailyShoplineOrderFieldsSync(): void {
+    this.runPythonJob("sync_shopline_order_fields.py");
+  }
+
   private runPythonJob(scriptFile: string): void {
     const scriptPath = path.resolve(process.cwd(), "jobs", scriptFile);
     this.logger.log(`开始执行脚本：${scriptPath}`);
