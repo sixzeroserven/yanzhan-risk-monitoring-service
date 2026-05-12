@@ -119,6 +119,7 @@ docker compose up -d --build
 
 - `scripts/azure-vm-bootstrap.sh`：在虚拟机上初始化 Docker 环境（一次性）  
 - `scripts/azure-vm-deploy.sh`：打包上传项目、执行 `docker compose up -d --build`，并按脚本逻辑处理数据库（如 `prisma db push` 等，以脚本实际内容为准）  
+- `scripts/azure-vm-enable-https.sh`：为已解析到 VM 的域名安装 Let’s Encrypt 证书并启用 HTTPS  
 
 ### 1）创建虚拟机
 
@@ -160,11 +161,29 @@ cp .env.docker.example .env
 - `http://<vm_ip>/health`  
 - `http://<vm_ip>/docs`  
 
-### 安全说明（暂无独立域名时）
+### 6）启用 HTTPS（域名就绪后）
+
+确认域名 A 记录已解析到 VM 公网 IP，并且 Azure 网络安全组已放行 `80`、`443` 后执行：
+
+```bash
+./scripts/azure-vm-enable-https.sh <ssh_user> <vm_ip> <domain> [ssh_key_path] [certbot_email]
+```
+
+示例：
+
+```bash
+./scripts/azure-vm-enable-https.sh azureuser 20.6.132.23 yanzhan.eu.cc ~/.ssh/id_rsa
+```
+
+完成后访问：
+
+- `https://<domain>/health`
+- `https://<domain>/docs`
+
+### 安全说明
 
 - 应用容器仅监听 `127.0.0.1:3000`，由宿主机 Nginx 在 `80` 端口反向代理对外访问。  
-- 网络安全组可保留 `443` 开放，便于后续接入 HTTPS。  
-- 域名就绪后建议使用 Let’s Encrypt（`certbot`）等切换为 HTTPS。  
+- HTTPS 由宿主机 Nginx 和 Let’s Encrypt（`certbot`）处理，证书会通过 `certbot.timer` 自动续期。  
 
 ## 定时任务模块
 

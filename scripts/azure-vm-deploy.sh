@@ -92,7 +92,12 @@ ssh ${SSH_OPTS} "${REMOTE}" "
   fi
   docker compose ps
 
-  sudo tee /etc/nginx/sites-available/shoplazza-blacklist >/dev/null <<'EOF'
+  if sudo find /etc/letsencrypt/live -mindepth 1 -maxdepth 1 -type d 2>/dev/null | grep -q .; then
+    echo '==> 检测到已有 Let'\''s Encrypt 证书，保留当前 Nginx HTTPS 配置'
+    sudo nginx -t
+    sudo systemctl reload nginx
+  else
+    sudo tee /etc/nginx/sites-available/shoplazza-blacklist >/dev/null <<'EOF'
 server {
     listen 80;
     listen [::]:80;
@@ -113,10 +118,11 @@ server {
 }
 EOF
 
-  sudo rm -f /etc/nginx/sites-enabled/default
-  sudo ln -sfn /etc/nginx/sites-available/shoplazza-blacklist /etc/nginx/sites-enabled/shoplazza-blacklist
-  sudo nginx -t
-  sudo systemctl reload nginx
+    sudo rm -f /etc/nginx/sites-enabled/default
+    sudo ln -sfn /etc/nginx/sites-available/shoplazza-blacklist /etc/nginx/sites-enabled/shoplazza-blacklist
+    sudo nginx -t
+    sudo systemctl reload nginx
+  fi
 "
 
 echo "==> 部署完成"
