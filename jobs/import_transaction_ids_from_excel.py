@@ -1,8 +1,9 @@
 """
 用途：解决新轮询系统中1000页后无法访问的数据，使用excel进行导入
 
-从 Excel 第一行表头识别列：「A端订单号」（或「订单编号」）匹配 orders.order_id，
+从 Excel 第一行表头识别列：「A端订单号」（或「订单编号」）对应 orders.order_id，
 「平台订单号」（或「交易号」）写入 orders.transaction_id。
+用 Excel 中的订单编号在库里匹配：order_id 包含该片段（LOCATE，等价于 LIKE '%片段%'）；若命中多个不同的 order_id 则跳过；若多条记录实为同一 order_id 则正常更新。
 匹配不上的行跳过，不插入新订单。
 
 依赖：pip install openpyxl（见 jobs/requirements.txt）
@@ -38,7 +39,7 @@ MYSQL_CONFIG = {
 
 
 def normalize_header(text: Any) -> str:
-    """标准化表头，用于模糊匹配"""
+    """标准化表头，用于与候选列名比较"""
     if text is None:
         return ""
     return str(text).strip().lower().replace(" ", "").replace("_", "")
@@ -78,7 +79,6 @@ def resolve_columns(header_row: Tuple[Any, ...]) -> Tuple[int, int]:
     order_col = None
     txn_col = None
 
-    # 精确匹配
     for idx, raw in enumerate(raw_headers):
         if raw in order_candidates_raw:
             order_col = idx
@@ -88,7 +88,6 @@ def resolve_columns(header_row: Tuple[Any, ...]) -> Tuple[int, int]:
             txn_col = idx
             break
 
-    # 标准化匹配
     if order_col is None:
         for idx, norm in enumerate(norm_headers):
             if norm in order_candidates_norm:
@@ -159,6 +158,7 @@ def import_excel(excel_path: str, dry_run: bool) -> Dict[str, int]:
         "unique_order_ids_with_txn": len(pairs),
         "db_updated": 0,
         "db_no_match": 0,
+        "db_ambiguous": 0,
     }
 
     if dry_run:
@@ -171,16 +171,31 @@ def import_excel(excel_path: str, dry_run: bool) -> Dict[str, int]:
         ensure_transaction_id_column(cursor)
         conn.commit()
 
-        sql = "UPDATE orders SET transaction_id = %s WHERE order_id = %s"
+        # 与 order_id LIKE '%Excel片段%' 等价；DISTINCT 避免同一 order_id 多行时误判为「多条」
+        select_sql = (
+            "SELECT DISTINCT order_id FROM orders WHERE LOCATE(%s, order_id) > 0 LIMIT 3"
+        )
+        update_sql = "UPDATE orders SET transaction_id = %s WHERE order_id = %s"
         for order_id, txn in pairs.items():
             tid = txn[:100] if len(txn) > 100 else txn
             if len(txn) > 100:
-                logger.warning("平台订单号超长已截断：order_id=%s len=%s", order_id, len(txn))
-            cursor.execute(sql, (tid, order_id))
-            if cursor.rowcount > 0:
-                stats["db_updated"] += cursor.rowcount
-            else:
+                logger.warning("平台订单号超长已截断：excel_order=%s len=%s", order_id, len(txn))
+            cursor.execute(select_sql, (order_id,))
+            hits = [row[0] for row in cursor.fetchall()]
+            unique_ids = list(dict.fromkeys(hits))
+            if len(unique_ids) == 0:
                 stats["db_no_match"] += 1
+            elif len(unique_ids) == 1:
+                cursor.execute(update_sql, (tid, unique_ids[0]))
+                if cursor.rowcount > 0:
+                    stats["db_updated"] += cursor.rowcount
+            else:
+                stats["db_ambiguous"] += 1
+                logger.warning(
+                    "订单号模糊匹配到多个不同 order_id，已跳过：excel=%s matches=%s",
+                    order_id,
+                    unique_ids[:5],
+                )
 
         conn.commit()
     finally:
@@ -202,12 +217,13 @@ def main() -> None:
 
     stats = import_excel(args.excel, dry_run=args.dry_run)
     logger.info(
-        "完成：excel_data_rows=%s skipped=%s unique_pairs=%s db_updated=%s db_no_match=%s dry_run=%s",
+        "完成：excel_data_rows=%s skipped=%s unique_pairs=%s db_updated=%s db_no_match=%s db_ambiguous=%s dry_run=%s",
         stats["excel_data_rows"],
         stats["skipped_empty_or_no_order"],
         stats["unique_order_ids_with_txn"],
         stats["db_updated"],
         stats["db_no_match"],
+        stats.get("db_ambiguous", 0),
         args.dry_run,
     )
 
