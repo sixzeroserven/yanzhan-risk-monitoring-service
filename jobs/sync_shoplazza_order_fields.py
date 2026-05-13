@@ -2,7 +2,8 @@
 多店铺 Shoplazza：分页订单列表按 order_id 匹配本地 orders，写入扩展字段（列表 JSON 为准）。
 单笔详情补全：--fetch-detail 或 SHOPLAZZA_FETCH_ORDER_DETAIL=1。
 列表常省略 device 时：--fetch-detail-if-no-device 或 SHOPLAZZA_FETCH_DETAIL_IF_NO_DEVICE=1。
-店铺：SHOPLAZZA_STORES_JSON 或 SHOPLAZZA_STORE_DOMAIN + SHOPLAZZA_ADMIN_TOKEN。
+店铺：优先 SHOPLAZZA_CRAWL_STORES_JSON（仅爬取/同步任务），未设时回退 SHOPLAZZA_STORES_JSON，
+或 SHOPLAZZA_STORE_DOMAIN + SHOPLAZZA_ADMIN_TOKEN。每项需 storeDomain、adminToken（webhookSecret 可省略）。
 调试打印：--debug-fetch / SHOPLAZZA_DEBUG_FETCH=1。
 """
 from __future__ import annotations
@@ -142,7 +143,9 @@ def ensure_sync_columns(cursor) -> None:
 
 
 def load_stores() -> List[Dict[str, str]]:
-    raw = (os.getenv("SHOPLAZZA_STORES_JSON") or "").strip()
+    raw = (os.getenv("SHOPLAZZA_CRAWL_STORES_JSON") or "").strip()
+    if not raw:
+        raw = (os.getenv("SHOPLAZZA_STORES_JSON") or "").strip()
     stores: List[Dict[str, str]] = []
     if raw:
         try:
@@ -156,7 +159,8 @@ def load_stores() -> List[Dict[str, str]]:
                     if domain and token:
                         stores.append({"storeDomain": domain, "adminToken": token})
         except json.JSONDecodeError as e:
-            logger.error("SHOPLAZZA_STORES_JSON 解析失败: %s", e)
+            src = "SHOPLAZZA_CRAWL_STORES_JSON" if (os.getenv("SHOPLAZZA_CRAWL_STORES_JSON") or "").strip() else "SHOPLAZZA_STORES_JSON"
+            logger.error("%s 解析失败: %s", src, e)
     if stores:
         return stores
 
@@ -166,7 +170,8 @@ def load_stores() -> List[Dict[str, str]]:
         return [{"storeDomain": domain, "adminToken": token}]
 
     raise RuntimeError(
-        "缺少店铺配置：请设置 SHOPLAZZA_STORES_JSON，或 SHOPLAZZA_STORE_DOMAIN + SHOPLAZZA_ADMIN_TOKEN"
+        "缺少店铺配置：请设置 SHOPLAZZA_CRAWL_STORES_JSON（推荐）或 SHOPLAZZA_STORES_JSON，"
+        "或 SHOPLAZZA_STORE_DOMAIN + SHOPLAZZA_ADMIN_TOKEN"
     )
 
 
