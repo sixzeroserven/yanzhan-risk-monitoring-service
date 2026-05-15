@@ -139,6 +139,7 @@ def init_database():
         buyer_account VARCHAR(200) COMMENT '买家账号',
         buyer_country VARCHAR(10) COMMENT '买家国家代码',
         black_state TINYINT(1) NOT NULL DEFAULT 0 COMMENT '黑名单状态: 0-非黑名单, 1-黑名单',
+        order_state VARCHAR(64) COMMENT '店小秘 orderState',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         INDEX idx_order_id (order_id),
@@ -147,6 +148,7 @@ def init_database():
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """
     cursor.execute(create_orders_sql)
+    ensure_order_state_column(cursor)
 
     create_address_sql = """
     CREATE TABLE IF NOT EXISTS order_address (
@@ -177,6 +179,30 @@ def init_database():
     logger.info("数据库表初始化完成")
 
 
+def extract_order_state(order_item: Dict[str, Any]) -> Optional[str]:
+    """店小秘接口 orderState 字段，存库为 order_state。"""
+    val = order_item.get("orderState")
+    if val is None:
+        return None
+    text = str(val).strip()
+    return text if text else None
+
+
+def ensure_order_state_column(cursor) -> None:
+    cursor.execute(
+        """
+        SELECT COUNT(1) FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 'orders' AND column_name = 'order_state'
+        """
+    )
+    if cursor.fetchone()[0] == 0:
+        cursor.execute(
+            "ALTER TABLE orders ADD COLUMN order_state VARCHAR(64) DEFAULT NULL "
+            "COMMENT '店小秘 orderState' AFTER black_state"
+        )
+        logger.info("已为 orders 表新增 order_state 字段")
+
+
 # ======================== 保存单个订单（含地址及子订单） ========================
 def save_single_order(order_item: Dict[str, Any], fallback_addr: Optional[Dict[str, Any]] = None, forced_black_state: Optional[int] = None) -> bool:
     """
@@ -205,14 +231,15 @@ def save_single_order(order_item: Dict[str, Any], fallback_addr: Optional[Dict[s
     try:
         # 订单主表：插入或更新
         order_sql = """
-        INSERT INTO orders (order_id, package_number, buyer_name, contact_name, buyer_account, buyer_country, black_state)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO orders (order_id, package_number, buyer_name, contact_name, buyer_account, buyer_country, black_state, order_state)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE
             buyer_name = VALUES(buyer_name),
             contact_name = VALUES(contact_name),
             buyer_account = VALUES(buyer_account),
             buyer_country = VALUES(buyer_country),
-            black_state = VALUES(black_state)
+            black_state = VALUES(black_state),
+            order_state = VALUES(order_state)
         """
         order_values = (
             order_id,
@@ -221,7 +248,8 @@ def save_single_order(order_item: Dict[str, Any], fallback_addr: Optional[Dict[s
             order_item.get('contactName'),
             order_item.get('buyerAccount'),
             order_item.get('buyerCountry'),
-            black_state
+            black_state,
+            extract_order_state(order_item),
         )
         cursor.execute(order_sql, order_values)
         conn.commit()

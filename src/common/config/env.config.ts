@@ -32,12 +32,14 @@ export class EnvConfig {
       !!process.env.SHOPLAZZA_STORE_DOMAIN &&
       !!process.env.SHOPLAZZA_ADMIN_TOKEN &&
       !!process.env.SHOPLAZZA_WEBHOOK_SECRET;
-    const rawStores = (process.env.SHOPLAZZA_STORES_JSON || "").trim();
-    const hasMultiStore = this.hasValidShoplazzaStoresJson(rawStores);
+    const rawWebhookStores = (process.env.SHOPLAZZA_WEBHOOK_STORES_JSON || "").trim();
+    const rawLegacyStores = (process.env.SHOPLAZZA_STORES_JSON || "").trim();
+    const hasMultiStore =
+      this.hasValidShoplazzaStoresJson(rawWebhookStores) || this.hasValidShoplazzaStoresJson(rawLegacyStores);
 
     if (!hasSingleStore && !hasMultiStore) {
       throw new Error(
-        "缺少 Shoplazza 店铺配置。请配置 SHOPLAZZA_STORES_JSON，或配置单店铺变量（SHOPLAZZA_STORE_DOMAIN + SHOPLAZZA_ADMIN_TOKEN + SHOPLAZZA_WEBHOOK_SECRET）。"
+        "缺少 Shoplazza 店铺配置。请配置 SHOPLAZZA_WEBHOOK_STORES_JSON（或兼容项 SHOPLAZZA_STORES_JSON），或配置单店铺变量（SHOPLAZZA_STORE_DOMAIN + SHOPLAZZA_ADMIN_TOKEN + SHOPLAZZA_WEBHOOK_SECRET）。"
       );
     }
   }
@@ -91,27 +93,15 @@ export class EnvConfig {
       webhookSecret: process.env.SHOPLAZZA_WEBHOOK_SECRET as string
     };
 
-    const raw = (process.env.SHOPLAZZA_STORES_JSON || "").trim();
-    if (!raw) return [fallbackStore];
+    const rawWebhook = (process.env.SHOPLAZZA_WEBHOOK_STORES_JSON || "").trim();
+    const fromWebhook = this.tryParseShoplazzaStoresJson(rawWebhook);
+    if (fromWebhook.length > 0) return fromWebhook;
 
-    try {
-      const parsed = JSON.parse(raw) as unknown;
-      if (!Array.isArray(parsed)) return [fallbackStore];
-      const stores = parsed
-        .map((item) => {
-          if (!item || typeof item !== "object" || Array.isArray(item)) return null;
-          const row = item as Record<string, unknown>;
-          const storeDomain = String(row.storeDomain || row.store_domain || "").trim();
-          const adminToken = String(row.adminToken || row.admin_token || "").trim();
-          const webhookSecret = String(row.webhookSecret || row.webhook_secret || "").trim();
-          if (!storeDomain || !adminToken || !webhookSecret) return null;
-          return { storeDomain, adminToken, webhookSecret };
-        })
-        .filter(Boolean) as ShoplazzaStoreConfig[];
-      return stores.length > 0 ? stores : [fallbackStore];
-    } catch {
-      return [fallbackStore];
-    }
+    const rawLegacy = (process.env.SHOPLAZZA_STORES_JSON || "").trim();
+    const fromLegacy = this.tryParseShoplazzaStoresJson(rawLegacy);
+    if (fromLegacy.length > 0) return fromLegacy;
+
+    return [fallbackStore];
   }
 
   get shoplazzaGlobal(): ShoplazzaGlobalConfig {
@@ -142,20 +132,29 @@ export class EnvConfig {
   }
 
   private hasValidShoplazzaStoresJson(raw: string): boolean {
-    if (!raw) return false;
+    return this.tryParseShoplazzaStoresJson(raw).length > 0;
+  }
+
+  /** 解析多店铺 JSON；无效或空则返回 []（不抛错）。 */
+  private tryParseShoplazzaStoresJson(raw: string): ShoplazzaStoreConfig[] {
+    if (!raw) return [];
     try {
       const parsed = JSON.parse(raw) as unknown;
-      if (!Array.isArray(parsed) || parsed.length === 0) return false;
-      return parsed.some((item) => {
-        if (!item || typeof item !== "object" || Array.isArray(item)) return false;
-        const row = item as Record<string, unknown>;
-        const storeDomain = String(row.storeDomain || row.store_domain || "").trim();
-        const adminToken = String(row.adminToken || row.admin_token || "").trim();
-        const webhookSecret = String(row.webhookSecret || row.webhook_secret || "").trim();
-        return !!storeDomain && !!adminToken && !!webhookSecret;
-      });
+      if (!Array.isArray(parsed)) return [];
+      const stores = parsed
+        .map((item) => {
+          if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+          const row = item as Record<string, unknown>;
+          const storeDomain = String(row.storeDomain || row.store_domain || "").trim();
+          const adminToken = String(row.adminToken || row.admin_token || "").trim();
+          const webhookSecret = String(row.webhookSecret || row.webhook_secret || "").trim();
+          if (!storeDomain || !adminToken || !webhookSecret) return null;
+          return { storeDomain, adminToken, webhookSecret };
+        })
+        .filter(Boolean) as ShoplazzaStoreConfig[];
+      return stores;
     } catch {
-      return false;
+      return [];
     }
   }
 }

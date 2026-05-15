@@ -109,9 +109,18 @@ docker compose up -d --build
 
 - `jobs/crawl_orders.py`：抓取店小秘订单，需在 `.env` 中配置 **`DIANXIAOMI_COOKIE`**（浏览器登录店小秘后复制完整 Cookie）。  
 - `jobs/sync_hipay_transaction_ids.py`：从 Hipay 同步交易号到库表 `transaction_id`，需配置 **`HIPAY_AUTHORIZATION`**（完整 `Bearer …` 字符串）。  
+- `jobs/sync_paypal_disputes.py`：从 PayPal Disputes API 同步争议数据到库表 `paypal_disputes`，需配置 **`PAYPAL_CLIENT_ID`**、**`PAYPAL_CLIENT_SECRET`**（可选 `PAYPAL_BASE_URL`）。  
 - `jobs/import_transaction_ids_from_excel.py`：从 Excel 表头匹配「A端订单号 / 订单编号」与「平台订单号 / 交易号」，按 `order_id` 更新 `transaction_id`（依赖 `openpyxl`，见 `jobs/requirements.txt`）。用法：`python3 jobs/import_transaction_ids_from_excel.py --excel /path/to/file.xlsx`。  
 
 示例变量见 `.env.example` / `.env.docker.example`。容器内执行脚本前请确认同一 `.env` 已包含上述变量（`docker compose` 的 `env_file` 会注入到 `app` 服务）。  
+
+PayPal 同步示例：
+
+```bash
+python3 jobs/sync_paypal_disputes.py
+python3 jobs/sync_paypal_disputes.py --start-time 2026-05-01T00:00:00Z --end-time 2026-05-11T00:00:00Z --fetch-detail
+python3 jobs/sync_paypal_disputes.py --dry-run
+```
 
 ## 部署到 Azure 虚拟机
 

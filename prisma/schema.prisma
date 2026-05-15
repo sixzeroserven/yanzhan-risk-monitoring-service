@@ -44,6 +44,7 @@ model Order {
   buyerAccount  String?   @map("buyer_account") @db.VarChar(200)
   buyerCountry  String?   @map("buyer_country") @db.VarChar(10)
   blackState    Boolean   @default(false) @map("black_state")
+  orderState    String?   @map("order_state") @db.VarChar(64)
   createdAt     DateTime? @default(now()) @map("created_at") @db.DateTime(0)
   updatedAt     DateTime? @default(now()) @updatedAt @map("updated_at") @db.DateTime(0)
 
