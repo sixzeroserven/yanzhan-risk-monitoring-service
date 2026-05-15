@@ -66,3 +66,34 @@ model OrderDeviceFingerprint {
   @@index([deviceFingerprint], map: "idx_device_fingerprint")
   @@map("order_device_fingerprint")
 }
+
+/// PayPal Reporting Transaction Search 同步行（jobs/sync_paypal_reporting_transactions.py）
+model PaypalReportingTransaction {
+  id                        BigInt    @id @default(autoincrement())
+  transactionId             String    @map("transaction_id") @db.VarChar(32)
+  transactionEventCode      String    @map("transaction_event_code") @db.VarChar(8)
+  transactionInitiationTs   String    @map("transaction_initiation_ts") @db.VarChar(32)
+  transactionUpdatedTs      String?   @map("transaction_updated_ts") @db.VarChar(32)
+  transactionStatus         String?   @map("transaction_status") @db.VarChar(8)
+  transactionAmountCurrency String?   @map("transaction_amount_currency") @db.VarChar(8)
+  transactionAmountValue    Decimal?  @map("transaction_amount_value") @db.Decimal(18, 6)
+  feeAmountCurrency         String?   @map("fee_amount_currency") @db.VarChar(8)
+  feeAmountValue            Decimal?  @map("fee_amount_value") @db.Decimal(18, 6)
+  invoiceId                 String?   @map("invoice_id") @db.VarChar(256)
+  customField               String?   @map("custom_field") @db.VarChar(256)
+  paypalReferenceId         String?   @map("paypal_reference_id") @db.VarChar(64)
+  paypalReferenceIdType     String?   @map("paypal_reference_id_type") @db.VarChar(16)
+  transactionSubject        String?   @map("transaction_subject") @db.VarChar(512)
+  payerAccountId            String?   @map("payer_account_id") @db.VarChar(64)
+  payerEmail                String?   @map("payer_email") @db.VarChar(256)
+  rawPayload                String?   @map("raw_payload") @db.LongText
+  createdAt                 DateTime? @default(now()) @map("created_at") @db.DateTime(0)
+  updatedAt                 DateTime? @default(now()) @updatedAt @map("updated_at") @db.DateTime(0)
+
+  @@unique([transactionId, transactionEventCode, transactionInitiationTs], map: "uk_txn_event_init")
+  @@index([transactionEventCode], map: "idx_event_code")
+  @@index([transactionInitiationTs], map: "idx_init_ts")
+  @@index([invoiceId], map: "idx_invoice")
+  @@index([customField], map: "idx_custom")
+  @@map("paypal_reporting_transactions")
+}

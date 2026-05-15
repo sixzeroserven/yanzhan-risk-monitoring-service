@@ -37,3 +37,33 @@ CREATE TABLE IF NOT EXISTS `order_address` (
   KEY `idx_phone` (`phone_number`),
   KEY `idx_email` (`email`)
 );
+
+-- jobs/sync_paypal_reporting_transactions.py：PayPal Transaction Search（Reporting）按 T 码筛选后的交易行
+CREATE TABLE IF NOT EXISTS `paypal_reporting_transactions` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `transaction_id` varchar(32) NOT NULL COMMENT 'PayPal 交易号',
+  `transaction_event_code` varchar(8) NOT NULL COMMENT 'T 码',
+  `transaction_initiation_ts` varchar(32) NOT NULL COMMENT 'API 返回的 initiation 时间原串，参与唯一键',
+  `transaction_updated_ts` varchar(32) DEFAULT NULL,
+  `transaction_status` varchar(8) DEFAULT NULL,
+  `transaction_amount_currency` varchar(8) DEFAULT NULL,
+  `transaction_amount_value` decimal(18,6) DEFAULT NULL,
+  `fee_amount_currency` varchar(8) DEFAULT NULL,
+  `fee_amount_value` decimal(18,6) DEFAULT NULL,
+  `invoice_id` varchar(256) DEFAULT NULL,
+  `custom_field` varchar(256) DEFAULT NULL,
+  `paypal_reference_id` varchar(64) DEFAULT NULL,
+  `paypal_reference_id_type` varchar(16) DEFAULT NULL,
+  `transaction_subject` varchar(512) DEFAULT NULL,
+  `payer_account_id` varchar(64) DEFAULT NULL,
+  `payer_email` varchar(256) DEFAULT NULL,
+  `raw_payload` longtext COMMENT '该条 transaction_details 完整 JSON',
+  `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_txn_event_init` (`transaction_id`,`transaction_event_code`,`transaction_initiation_ts`),
+  KEY `idx_event_code` (`transaction_event_code`),
+  KEY `idx_init_ts` (`transaction_initiation_ts`),
+  KEY `idx_invoice` (`invoice_id`(64)),
+  KEY `idx_custom` (`custom_field`(64))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
