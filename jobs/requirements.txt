@@ -1,4 +1,4 @@
 python-dotenv
-requests
+requests[socks]
 pymysql
 openpyxl

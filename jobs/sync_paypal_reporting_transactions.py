@@ -13,6 +13,8 @@ T 码参考：https://developer.paypal.com/docs/reports/reference/tcodes/
 环境变量（与 disputes 脚本共用）：
 - PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET
 - PAYPAL_BASE_URL（默认 https://api-m.paypal.com）
+- 多账号推荐：PAYPAL_ACCOUNTS_JSON 或 PAYPAL_ACCOUNT_KEYS（每个账号可配独立 PAYPAL_xxx_PROXY_URL）
+- PAYPAL_PROXY_URL（单账号兼容模式；HTTP/HTTPS 代理地址）
 - PAYPAL_REPORTING_PAGE_SIZE（默认 500，最大 500）
 - PAYPAL_REPORTING_EVENT_CODES（可选，逗号分隔，覆盖默认 T 码集合）
 - PAYPAL_REPORTING_MAX_BACKFILL_DAYS（无参默认回溯天数，默认与 API 窗口一致，见下）
@@ -20,6 +22,10 @@ T 码参考：https://developer.paypal.com/docs/reports/reference/tcodes/
 - PAYPAL_REPORTING_HTTP_READ_TIMEOUT（Reporting GET 单次读超时秒数，默认 300）
 - PAYPAL_REPORTING_HTTP_CONNECT_TIMEOUT（连接超时秒数，默认 30）
 - PAYPAL_REPORTING_HTTP_RETRIES（读超时/连接失败时最多尝试次数，默认 5）
+- PAYPAL_REPORTING_REQUEST_DELAY_SECONDS（每次 Reporting GET 前等待秒数，默认 1，避免触发限流）
+- PAYPAL_REPORTING_RATE_LIMIT_RETRIES（遇到 429 时最多尝试次数，默认 8）
+- PAYPAL_REPORTING_RATE_LIMIT_BASE_DELAY_SECONDS（429 无 Retry-After 时的初始等待秒数，默认 60）
+- PAYPAL_REPORTING_RATE_LIMIT_MAX_DELAY_SECONDS（429 最大等待秒数，默认 900）
 
 建表：
   - 推荐：在 MySQL 中执行仓库内 `sql/init.sql` 里 `paypal_reporting_transactions` 的 DDL；或 `npx prisma db push`（需配置 DATABASE_URL）。
@@ -44,11 +50,19 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import pymysql
 import requests
 from dotenv import load_dotenv
+from paypal_accounts import (
+    PayPalAccount,
+    fetch_account_egress_ip,
+    make_paypal_session,
+    mask_proxy_url,
+    select_paypal_accounts,
+)
 
 load_dotenv()
 
@@ -64,7 +78,6 @@ MYSQL_CONFIG = {
     "charset": "utf8mb4",
 }
 
-PAYPAL_BASE_URL = (os.getenv("PAYPAL_BASE_URL") or "https://api-m.paypal.com").rstrip("/")
 REPORTING_PAGE_SIZE_DEFAULT = min(500, max(1, int(os.getenv("PAYPAL_REPORTING_PAGE_SIZE", "200") or "500")))
 API_MAX_RANGE_DAYS = 31
 REPORTING_API_MAX_HISTORY_DAYS_DEFAULT = 1095
@@ -81,9 +94,6 @@ DEFAULT_REPORTING_EVENT_CODES: Tuple[str, ...] = (
     "T1205",
     "T1207",
     "T1208",
-    "T1300",
-    "T1301",
-    "T1302",
 )
 
 _AUTH_TCODES = frozenset({"T1300", "T1301", "T1302"})
@@ -116,19 +126,72 @@ def reporting_http_retries() -> int:
     return max(1, min(v, 15))
 
 
+def reporting_request_delay_seconds() -> float:
+    raw = (os.getenv("PAYPAL_REPORTING_REQUEST_DELAY_SECONDS") or "1").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        v = 1.0
+    return max(0.0, min(v, 60.0))
+
+
+def reporting_rate_limit_retries() -> int:
+    raw = (os.getenv("PAYPAL_REPORTING_RATE_LIMIT_RETRIES") or "8").strip()
+    try:
+        v = int(raw)
+    except ValueError:
+        v = 8
+    return max(1, min(v, 30))
+
+
+def reporting_rate_limit_base_delay_seconds() -> float:
+    raw = (os.getenv("PAYPAL_REPORTING_RATE_LIMIT_BASE_DELAY_SECONDS") or "60").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        v = 60.0
+    return max(1.0, min(v, 3600.0))
+
+
+def reporting_rate_limit_max_delay_seconds() -> float:
+    raw = (os.getenv("PAYPAL_REPORTING_RATE_LIMIT_MAX_DELAY_SECONDS") or "900").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        v = 900.0
+    return max(1.0, min(v, 7200.0))
+
+
+def retry_after_delay_seconds(response: requests.Response) -> Optional[float]:
+    raw = (response.headers.get("Retry-After") or "").strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        retry_at = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    return max(0.0, (retry_at.astimezone(timezone.utc) - now_utc()).total_seconds())
+
+
+def rate_limit_backoff_seconds(response: requests.Response, attempt: int) -> float:
+    retry_after = retry_after_delay_seconds(response)
+    if retry_after is not None:
+        return min(retry_after, reporting_rate_limit_max_delay_seconds())
+    delay = reporting_rate_limit_base_delay_seconds() * (2 ** (attempt - 1))
+    return min(delay, reporting_rate_limit_max_delay_seconds())
+
+
 def default_reporting_event_codes() -> Tuple[str, ...]:
     raw = (os.getenv("PAYPAL_REPORTING_EXCLUDE_AUTH_TCODES") or "").strip().lower()
     if raw in ("1", "true", "yes", "y", "on"):
         return tuple(c for c in DEFAULT_REPORTING_EVENT_CODES if c not in _AUTH_TCODES)
     return DEFAULT_REPORTING_EVENT_CODES
-
-
-def require_env(name: str) -> str:
-    v = (os.getenv(name) or "").strip()
-    if not v:
-        logger.error("请配置环境变量 %s", name)
-        raise SystemExit(1)
-    return v
 
 
 def now_utc() -> datetime:
@@ -215,13 +278,13 @@ def iter_date_chunks(start: datetime, end: datetime, max_days: int = API_MAX_RAN
         cur = chunk_end
 
 
-def get_access_token(session: requests.Session, client_id: str, client_secret: str) -> str:
-    url = f"{PAYPAL_BASE_URL}/v1/oauth2/token"
+def get_access_token(session: requests.Session, account: PayPalAccount) -> str:
+    url = f"{account.base_url}/v1/oauth2/token"
     timeout = (reporting_http_connect_timeout(), min(120.0, reporting_http_read_timeout()))
     r = session.post(
         url,
         data={"grant_type": "client_credentials"},
-        auth=(client_id, client_secret),
+        auth=(account.client_id, account.client_secret),
         headers={"Accept": "application/json", "Accept-Language": "en_US"},
         timeout=timeout,
     )
@@ -356,13 +419,14 @@ ON DUPLICATE KEY UPDATE
 def fetch_transactions_page(
     session: requests.Session,
     headers: Dict[str, str],
+    base_url: str,
     start_date: str,
     end_date: str,
     page: int,
     page_size: int,
     transaction_event_code: Optional[str],
 ) -> Tuple[List[Dict[str, Any]], int, int]:
-    url = f"{PAYPAL_BASE_URL}/v1/reporting/transactions"
+    url = f"{base_url}/v1/reporting/transactions"
     params: Dict[str, Any] = {
         "start_date": start_date,
         "end_date": end_date,
@@ -375,11 +439,45 @@ def fetch_transactions_page(
         params["transaction_event_code"] = transaction_event_code
 
     timeout = (reporting_http_connect_timeout(), reporting_http_read_timeout())
-    max_attempts = reporting_http_retries()
+    network_max_attempts = reporting_http_retries()
+    rate_limit_max_attempts = reporting_rate_limit_retries()
+    max_attempts = max(network_max_attempts, rate_limit_max_attempts)
     data: Optional[Dict[str, Any]] = None
     for attempt in range(1, max_attempts + 1):
         try:
+            request_delay = reporting_request_delay_seconds()
+            if request_delay > 0:
+                time.sleep(request_delay)
             r = session.get(url, headers=headers, params=params, timeout=timeout)
+            if r.status_code == 429:
+                if attempt >= rate_limit_max_attempts:
+                    logger.error("Reporting API 限流重试耗尽 status=%s body=%s", r.status_code, r.text[:800])
+                    r.raise_for_status()
+                delay = rate_limit_backoff_seconds(r, attempt)
+                logger.warning(
+                    "Reporting API 触发限流 429 (第 %s/%s 次)，%.0fs 后重试：body=%s",
+                    attempt,
+                    rate_limit_max_attempts,
+                    delay,
+                    r.text[:800],
+                )
+                time.sleep(delay)
+                continue
+            if 500 <= r.status_code < 600:
+                if attempt >= network_max_attempts:
+                    logger.error("Reporting API 服务端错误重试耗尽 status=%s body=%s", r.status_code, r.text[:800])
+                    r.raise_for_status()
+                delay = min(120.0, 5.0 * (2 ** (attempt - 1)))
+                logger.warning(
+                    "Reporting API 服务端错误 status=%s (第 %s/%s 次)，%.0fs 后重试：body=%s",
+                    r.status_code,
+                    attempt,
+                    network_max_attempts,
+                    delay,
+                    r.text[:800],
+                )
+                time.sleep(delay)
+                continue
             if r.status_code >= 400:
                 logger.error("Reporting API 失败 status=%s body=%s", r.status_code, r.text[:800])
                 r.raise_for_status()
@@ -390,13 +488,13 @@ def fetch_transactions_page(
             requests.exceptions.ConnectTimeout,
             requests.exceptions.ConnectionError,
         ) as e:
-            if attempt >= max_attempts:
+            if attempt >= network_max_attempts:
                 raise
             delay = min(120.0, 5.0 * (2 ** (attempt - 1)))
             logger.warning(
                 "Reporting GET 超时或连接失败 (第 %s/%s 次)，%.0fs 后重试: %s",
                 attempt,
-                max_attempts,
+                network_max_attempts,
                 delay,
                 e,
             )
@@ -413,6 +511,7 @@ def fetch_transactions_page(
 
 
 def sync_reporting_range(
+    account: PayPalAccount,
     start: datetime,
     end: datetime,
     event_codes: Tuple[str, ...],
@@ -429,10 +528,8 @@ def sync_reporting_range(
         "db_errors": 0,
     }
 
-    client_id = require_env("PAYPAL_CLIENT_ID")
-    client_secret = require_env("PAYPAL_CLIENT_SECRET")
-    session = requests.Session()
-    token = get_access_token(session, client_id, client_secret)
+    session = make_paypal_session(account)
+    token = get_access_token(session, account)
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -464,7 +561,7 @@ def sync_reporting_range(
                 while page <= total_pages:
                     stats["api_calls"] += 1
                     details, total_pages, total_items = fetch_transactions_page(
-                        session, headers, sd, ed, page, page_size, ec
+                        session, headers, account.base_url, sd, ed, page, page_size, ec
                     )
                     logger.info(
                         "  page=%s/%s total_items=%s 本页=%s",
@@ -506,6 +603,15 @@ def sync_reporting_range(
     return stats
 
 
+def log_account_egress_ip(account: PayPalAccount) -> None:
+    try:
+        ip = fetch_account_egress_ip(account)
+    except requests.RequestException as exc:
+        logger.warning("账号 %s 出口 IP 检测失败：%s", account.name, exc)
+        return
+    logger.info("账号 %s 出口 IP：%s", account.name, ip or "-")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="PayPal Reporting 交易 → MySQL（按 T 码筛选）")
     parser.add_argument("--start-date", default="", help="ISO8601 UTC，如 2025-01-01T00:00:00Z")
@@ -529,7 +635,13 @@ def main() -> None:
     )
     parser.add_argument("--page-size", type=int, default=REPORTING_PAGE_SIZE_DEFAULT, help="1-500")
     parser.add_argument("--dry-run", action="store_true", help="只请求与解析，不写库")
+    parser.add_argument(
+        "--paypal-account",
+        default="",
+        help="只同步指定 PayPal 账号名；多个用逗号分隔。默认同步全部配置账号",
+    )
     args = parser.parse_args()
+    accounts = select_paypal_accounts(args.paypal_account)
 
     page_size = max(1, min(500, int(args.page_size or 500)))
 
@@ -578,25 +690,31 @@ def main() -> None:
         )
         raise SystemExit(1)
 
-    logger.info(
-        "Reporting 同步：T 码数量=%s 示例=%s page_size=%s dry_run=%s",
-        len(event_codes),
-        ",".join(event_codes[:8]) + ("..." if len(event_codes) > 8 else ""),
-        page_size,
-        args.dry_run,
-    )
+    for account in accounts:
+        logger.info(
+            "Reporting 同步：account=%s base=%s proxy=%s T码数量=%s 示例=%s page_size=%s dry_run=%s",
+            account.name,
+            account.base_url,
+            mask_proxy_url(account.proxy_url),
+            len(event_codes),
+            ",".join(event_codes[:8]) + ("..." if len(event_codes) > 8 else ""),
+            page_size,
+            args.dry_run,
+        )
 
-    stats = sync_reporting_range(start, end, event_codes, page_size, dry_run=args.dry_run)
-    logger.info(
-        "完成：时间片×T码=%s api_calls=%s rows_parsed=%s rows_filtered_out=%s rows_matched=%s db_upsert=%s db_errors=%s",
-        stats["chunks"],
-        stats["api_calls"],
-        stats["rows_parsed"],
-        stats["rows_filtered_out"],
-        stats["rows_matched"],
-        stats.get("db_upsert", 0),
-        stats.get("db_errors", 0),
-    )
+        stats = sync_reporting_range(account, start, end, event_codes, page_size, dry_run=args.dry_run)
+        logger.info(
+            "账号 %s 完成：时间片×T码=%s api_calls=%s rows_parsed=%s rows_filtered_out=%s rows_matched=%s db_upsert=%s db_errors=%s",
+            account.name,
+            stats["chunks"],
+            stats["api_calls"],
+            stats["rows_parsed"],
+            stats["rows_filtered_out"],
+            stats["rows_matched"],
+            stats.get("db_upsert", 0),
+            stats.get("db_errors", 0),
+        )
+        log_account_egress_ip(account)
 
 
 if __name__ == "__main__":

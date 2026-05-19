@@ -109,8 +109,8 @@ docker compose up -d --build
 
 - `jobs/crawl_orders.py`：抓取店小秘订单，需在 `.env` 中配置 **`DIANXIAOMI_COOKIE`**（浏览器登录店小秘后复制完整 Cookie）。  
 - `jobs/sync_hipay_transaction_ids.py`：从 Hipay 同步交易号到库表 `transaction_id`，需配置 **`HIPAY_AUTHORIZATION`**（完整 `Bearer …` 字符串）。  
-- `jobs/sync_paypal_disputes.py`：从 PayPal Disputes API 同步争议数据到库表 `paypal_disputes`，需配置 **`PAYPAL_CLIENT_ID`**、**`PAYPAL_CLIENT_SECRET`**（可选 `PAYPAL_BASE_URL`）。  
-- `jobs/sync_paypal_reporting_transactions.py`：从 PayPal Reporting Transaction Search（`/v1/reporting/transactions`）按 T 码拉取交易并写入 `paypal_reporting_transactions`；与 disputes 共用同一套 **`PAYPAL_CLIENT_*`**。可选环境变量见 `.env.example` 中 `PAYPAL_REPORTING_*`（分页、T 码集合、回溯上限、HTTP 超时与重试）。建表见 `sql/init.sql` 或 `npx prisma db push`。  
+- `jobs/sync_paypal_disputes.py`：从 PayPal Disputes API 同步争议数据到库表 `paypal_disputes`，单账号可配置 **`PAYPAL_CLIENT_ID`**、**`PAYPAL_CLIENT_SECRET`**（可选 `PAYPAL_BASE_URL`、`PAYPAL_PROXY_URL`）。多 PayPal 账号可配置 `PAYPAL_ACCOUNTS_JSON` 或 `PAYPAL_ACCOUNT_KEYS`，每个账号独立 `proxy_url`，OAuth/Disputes API 都走该账号自己的静态住宅代理。  
+- `jobs/sync_paypal_reporting_transactions.py`：从 PayPal Reporting Transaction Search（`/v1/reporting/transactions`）按 T 码拉取交易并写入 `paypal_reporting_transactions`；与 disputes 共用同一套 PayPal 多账号/代理配置。可选环境变量见 `.env.example` 中 `PAYPAL_REPORTING_*`（分页、T 码集合、回溯上限、HTTP 超时与重试）。建表见 `sql/init.sql` 或 `npx prisma db push`。  
 - `jobs/import_transaction_ids_from_excel.py`：从 Excel 表头匹配「A端订单号 / 订单编号」与「平台订单号 / 交易号」，按 `order_id` 更新 `transaction_id`（依赖 `openpyxl`，见 `jobs/requirements.txt`）。用法：`python3 jobs/import_transaction_ids_from_excel.py --excel /path/to/file.xlsx`。  
 
 示例变量见 `.env.example` / `.env.docker.example`。容器内执行脚本前请确认同一 `.env` 已包含上述变量（`docker compose` 的 `env_file` 会注入到 `app` 服务）。  
@@ -118,14 +118,34 @@ docker compose up -d --build
 PayPal 同步示例：
 
 ```bash
+# 默认同步所有已配置 PayPal 账号；每个账号使用自己的 proxy_url / PAYPAL_xxx_PROXY_URL。
 python3 jobs/sync_paypal_disputes.py
 python3 jobs/sync_paypal_disputes.py --start-time 2026-05-01T00:00:00Z --end-time 2026-05-11T00:00:00Z --fetch-detail
 python3 jobs/sync_paypal_disputes.py --dry-run
+python3 jobs/sync_paypal_disputes.py --paypal-account paypal_a
+
+python3 jobs/check_paypal_proxy_ip.py --paypal-account paypal_a
 
 python3 jobs/sync_paypal_reporting_transactions.py
 python3 jobs/sync_paypal_reporting_transactions.py --lookback-days 30 --dry-run
 python3 jobs/sync_paypal_reporting_transactions.py --max-backfill-days 1095
+python3 jobs/sync_paypal_reporting_transactions.py --paypal-account paypal_a,paypal_b
 ```
+
+多 PayPal 账号代理配置示例：
+
+```bash
+PAYPAL_ACCOUNTS_JSON='[
+  {"name":"paypal_a","client_id":"client_id_a","client_secret":"client_secret_a","proxy_url":"socks5h://proxy_user_a:proxy_password_a@proxy-a.example:12345"},
+  {"name":"paypal_b","client_id":"client_id_b","client_secret":"client_secret_b","proxy_url":"socks5h://proxy_user_b:proxy_password_b@proxy-b.example:12345"}
+]'
+```
+
+也可以使用 `PAYPAL_ACCOUNT_KEYS=paypal_a,paypal_b`，再分别配置 `PAYPAL_PAYPAL_A_CLIENT_ID`、`PAYPAL_PAYPAL_A_CLIENT_SECRET`、`PAYPAL_PAYPAL_A_PROXY_URL` 等分项变量。
+
+SOCKS5 代理建议写成 `socks5h://user:password@host:port`，这样域名解析也会通过代理完成；依赖已在 `jobs/requirements.txt` 中改为 `requests[socks]`，部署时重新执行 `pip install -r jobs/requirements.txt` 或重建 Docker 镜像即可。
+
+Reporting API 若返回 `RATE_LIMIT_REACHED` / HTTP 429，脚本会自动按 `Retry-After` 或指数退避重试；默认每次 Reporting GET 前等待 `PAYPAL_REPORTING_REQUEST_DELAY_SECONDS=1` 秒，429 最多尝试 `PAYPAL_REPORTING_RATE_LIMIT_RETRIES=8` 次，可在 `.env` 中调大等待时间。
 
 ## 部署到 Azure 虚拟机
 

@@ -10,9 +10,11 @@
 环境变量（必填）：
 - PAYPAL_CLIENT_ID
 - PAYPAL_CLIENT_SECRET
+- 多账号推荐：PAYPAL_ACCOUNTS_JSON 或 PAYPAL_ACCOUNT_KEYS（每个账号可配独立 PAYPAL_xxx_PROXY_URL）
 
 环境变量（可选）：
 - PAYPAL_BASE_URL=https://api-m.paypal.com
+- PAYPAL_PROXY_URL=（单账号兼容模式；HTTP/HTTPS 代理地址）
 - PAYPAL_DISPUTE_PAGE_SIZE=50
 - PAYPAL_DISPUTE_LOOKBACK_DAYS=（不设且未传 --start-time 时，默认用接口允许的最早起点：当前时刻起往回 180 天；若设为数字则按最近 N 天，N 最大 180）
 - PAYPAL_DISPUTE_STATE=
@@ -44,6 +46,13 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import pymysql
 import requests
 from dotenv import load_dotenv
+from paypal_accounts import (
+    PayPalAccount,
+    fetch_account_egress_ip,
+    make_paypal_session,
+    mask_proxy_url,
+    select_paypal_accounts,
+)
 
 load_dotenv()
 
@@ -59,7 +68,6 @@ MYSQL_CONFIG = {
     "charset": "utf8mb4",
 }
 
-PAYPAL_BASE_URL = (os.getenv("PAYPAL_BASE_URL") or "https://api-m.paypal.com").rstrip("/")
 PAGE_SIZE_DEFAULT = int(os.getenv("PAYPAL_DISPUTE_PAGE_SIZE", "50") or "50")
 # https://developer.paypal.com/docs/api/customer-disputes/v1/ — start_time 必须在最近 180 天内。
 PAYPAL_LIST_START_MAX_LOOKBACK_DAYS = 180
@@ -124,14 +132,6 @@ def default_lookback_days_from_env() -> Optional[int]:
         return int(raw)
     except ValueError:
         return None
-
-
-def require_env(name: str) -> str:
-    value = (os.getenv(name) or "").strip()
-    if value:
-        return value
-    logger.error("请配置环境变量 %s", name)
-    raise SystemExit(1)
 
 
 def clamp_page_size(size: int) -> int:
@@ -210,12 +210,12 @@ def resolve_time_window(
     return to_paypal_time(start_dt), to_paypal_time(end_dt) if end_dt else None
 
 
-def get_access_token(session: requests.Session, client_id: str, client_secret: str) -> str:
-    url = f"{PAYPAL_BASE_URL}/v1/oauth2/token"
+def get_access_token(session: requests.Session, account: PayPalAccount) -> str:
+    url = f"{account.base_url}/v1/oauth2/token"
     response = session.post(
         url,
         data={"grant_type": "client_credentials"},
-        auth=(client_id, client_secret),
+        auth=(account.client_id, account.client_secret),
         headers={"Accept": "application/json", "Accept-Language": "en_US"},
         timeout=60,
     )
@@ -468,8 +468,9 @@ def fetch_dispute_detail(
     session: requests.Session,
     headers: Dict[str, str],
     dispute_id: str,
+    base_url: str,
 ) -> Dict[str, Any]:
-    url = f"{PAYPAL_BASE_URL}/v1/customer/disputes/{dispute_id}"
+    url = f"{base_url}/v1/customer/disputes/{dispute_id}"
     response = session.get(url, headers=headers, timeout=60)
     if response.status_code >= 400:
         logger.warning("拉取争议详情失败 dispute_id=%s status=%s", dispute_id, response.status_code)
@@ -481,6 +482,7 @@ def fetch_dispute_detail(
 def list_disputes(
     session: requests.Session,
     headers: Dict[str, str],
+    base_url: str,
     create_time_after: str,
     create_time_before: Optional[str],
     dispute_state: str,
@@ -488,7 +490,7 @@ def list_disputes(
     max_pages: int,
     fetch_detail: bool,
 ) -> Tuple[List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]], Dict[str, int]]:
-    endpoint = f"{PAYPAL_BASE_URL}/v1/customer/disputes"
+    endpoint = f"{base_url}/v1/customer/disputes"
     rows: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = []
     stats = {"pages": 0, "api_items": 0, "detail_calls": 0, "empty_dispute_id": 0}
 
@@ -539,7 +541,7 @@ def list_disputes(
 
             detail_opt: Optional[Dict[str, Any]] = None
             if fetch_detail:
-                detail_opt = fetch_dispute_detail(session, headers, dispute_id)
+                detail_opt = fetch_dispute_detail(session, headers, dispute_id, base_url)
                 stats["detail_calls"] += 1
                 if not detail_opt or not pick_str(detail_opt, "dispute_id", "id"):
                     detail_opt = None
@@ -605,7 +607,7 @@ def persist_dispute_rows(rows: List[Dict[str, Any]], dry_run: bool, stats: Dict[
         conn.close()
 
 
-def sync_disputes_by_ids(dispute_ids: List[str], dry_run: bool) -> Dict[str, int]:
+def sync_disputes_by_ids(dispute_ids: List[str], dry_run: bool, account: PayPalAccount) -> Dict[str, int]:
     """仅 GET /v1/customer/disputes/{id} 并 upsert，用于列表接口时间窗口外的争议。"""
     stats: Dict[str, int] = {
         "pages": 0,
@@ -616,11 +618,8 @@ def sync_disputes_by_ids(dispute_ids: List[str], dry_run: bool) -> Dict[str, int
         "db_insert_or_update": 0,
         "db_skipped": 0,
     }
-    client_id = require_env("PAYPAL_CLIENT_ID")
-    client_secret = require_env("PAYPAL_CLIENT_SECRET")
-
-    session = requests.Session()
-    token = get_access_token(session, client_id, client_secret)
+    session = make_paypal_session(account)
+    token = get_access_token(session, account)
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -629,7 +628,7 @@ def sync_disputes_by_ids(dispute_ids: List[str], dry_run: bool) -> Dict[str, int
 
     rows: List[Dict[str, Any]] = []
     for did in dispute_ids:
-        detail_opt = fetch_dispute_detail(session, headers, did)
+        detail_opt = fetch_dispute_detail(session, headers, did, account.base_url)
         stats["detail_calls"] += 1
         if not detail_opt or not pick_str(detail_opt, "dispute_id", "id"):
             stats["detail_fetch_failed"] += 1
@@ -651,6 +650,7 @@ def sync_disputes_by_ids(dispute_ids: List[str], dry_run: bool) -> Dict[str, int
 
 
 def sync_disputes(
+    account: PayPalAccount,
     start_time: str,
     end_time: Optional[str],
     dispute_state: str,
@@ -659,11 +659,8 @@ def sync_disputes(
     dry_run: bool,
     fetch_detail: bool,
 ) -> Dict[str, int]:
-    client_id = require_env("PAYPAL_CLIENT_ID")
-    client_secret = require_env("PAYPAL_CLIENT_SECRET")
-
-    session = requests.Session()
-    token = get_access_token(session, client_id, client_secret)
+    session = make_paypal_session(account)
+    token = get_access_token(session, account)
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -673,6 +670,7 @@ def sync_disputes(
     disputes, stats = list_disputes(
         session=session,
         headers=headers,
+        base_url=account.base_url,
         create_time_after=start_time,
         create_time_before=end_time,
         dispute_state=dispute_state,
@@ -697,6 +695,15 @@ def sync_disputes(
 
     persist_dispute_rows(rows, dry_run, stats)
     return stats
+
+
+def log_account_egress_ip(account: PayPalAccount) -> None:
+    try:
+        ip = fetch_account_egress_ip(account)
+    except requests.RequestException as exc:
+        logger.warning("账号 %s 出口 IP 检测失败：%s", account.name, exc)
+        return
+    logger.info("账号 %s 出口 IP：%s", account.name, ip or "-")
 
 
 def main() -> None:
@@ -729,25 +736,36 @@ def main() -> None:
         action="store_true",
         help="使用脚本内建 BUILTIN_DISPUTE_IDS_BACKFILL 仅拉详情并 upsert",
     )
+    parser.add_argument(
+        "--paypal-account",
+        default="",
+        help="只同步指定 PayPal 账号名；多个用逗号分隔。默认同步全部配置账号",
+    )
     args = parser.parse_args()
+    accounts = select_paypal_accounts(args.paypal_account)
 
     if args.backfill_builtin_dispute_ids:
         ids = list(BUILTIN_DISPUTE_IDS_BACKFILL)
-        logger.info(
-            "按 dispute_id 仅拉详情（内建数组）：base=%s count=%s dry_run=%s",
-            PAYPAL_BASE_URL,
-            len(ids),
-            args.dry_run,
-        )
-        stats = sync_disputes_by_ids(ids, dry_run=args.dry_run)
-        logger.info(
-            "完成：detail_calls=%s detail_fetch_failed=%s empty_dispute_id=%s db_insert_or_update=%s db_skipped=%s",
-            stats.get("detail_calls", 0),
-            stats.get("detail_fetch_failed", 0),
-            stats.get("empty_dispute_id", 0),
-            stats.get("db_insert_or_update", 0),
-            stats.get("db_skipped", 0),
-        )
+        for account in accounts:
+            logger.info(
+                "按 dispute_id 仅拉详情（内建数组）：account=%s base=%s proxy=%s count=%s dry_run=%s",
+                account.name,
+                account.base_url,
+                mask_proxy_url(account.proxy_url),
+                len(ids),
+                args.dry_run,
+            )
+            stats = sync_disputes_by_ids(ids, dry_run=args.dry_run, account=account)
+            logger.info(
+                "账号 %s 完成：detail_calls=%s detail_fetch_failed=%s empty_dispute_id=%s db_insert_or_update=%s db_skipped=%s",
+                account.name,
+                stats.get("detail_calls", 0),
+                stats.get("detail_fetch_failed", 0),
+                stats.get("empty_dispute_id", 0),
+                stats.get("db_insert_or_update", 0),
+                stats.get("db_skipped", 0),
+            )
+            log_account_egress_ip(account)
         return
 
     ids_raw = (args.dispute_ids or "").strip()
@@ -756,21 +774,26 @@ def main() -> None:
         if not ids:
             logger.error("--dispute-ids 解析后为空")
             raise SystemExit(1)
-        logger.info(
-            "按 dispute_id 仅拉详情：base=%s count=%s dry_run=%s",
-            PAYPAL_BASE_URL,
-            len(ids),
-            args.dry_run,
-        )
-        stats = sync_disputes_by_ids(ids, dry_run=args.dry_run)
-        logger.info(
-            "完成：detail_calls=%s detail_fetch_failed=%s empty_dispute_id=%s db_insert_or_update=%s db_skipped=%s",
-            stats.get("detail_calls", 0),
-            stats.get("detail_fetch_failed", 0),
-            stats.get("empty_dispute_id", 0),
-            stats.get("db_insert_or_update", 0),
-            stats.get("db_skipped", 0),
-        )
+        for account in accounts:
+            logger.info(
+                "按 dispute_id 仅拉详情：account=%s base=%s proxy=%s count=%s dry_run=%s",
+                account.name,
+                account.base_url,
+                mask_proxy_url(account.proxy_url),
+                len(ids),
+                args.dry_run,
+            )
+            stats = sync_disputes_by_ids(ids, dry_run=args.dry_run, account=account)
+            logger.info(
+                "账号 %s 完成：detail_calls=%s detail_fetch_failed=%s empty_dispute_id=%s db_insert_or_update=%s db_skipped=%s",
+                account.name,
+                stats.get("detail_calls", 0),
+                stats.get("detail_fetch_failed", 0),
+                stats.get("empty_dispute_id", 0),
+                stats.get("db_insert_or_update", 0),
+                stats.get("db_skipped", 0),
+            )
+            log_account_egress_ip(account)
         return
 
     fetch_detail = args.fetch_detail
@@ -790,36 +813,42 @@ def main() -> None:
         logger.error("时间参数错误：%s", exc)
         raise SystemExit(1)
 
-    logger.info(
-        "开始同步 PayPal disputes：base=%s start=%s end=%s state=%s page_size=%s fetch_detail=%s dry_run=%s",
-        PAYPAL_BASE_URL,
-        start_time,
-        end_time or "-",
-        args.dispute_state or "-",
-        page_size,
-        fetch_detail,
-        args.dry_run,
-    )
+    for account in accounts:
+        logger.info(
+            "开始同步 PayPal disputes：account=%s base=%s proxy=%s start=%s end=%s state=%s page_size=%s fetch_detail=%s dry_run=%s",
+            account.name,
+            account.base_url,
+            mask_proxy_url(account.proxy_url),
+            start_time,
+            end_time or "-",
+            args.dispute_state or "-",
+            page_size,
+            fetch_detail,
+            args.dry_run,
+        )
 
-    stats = sync_disputes(
-        start_time=start_time,
-        end_time=end_time,
-        dispute_state=args.dispute_state.strip(),
-        page_size=page_size,
-        max_pages=max(0, args.max_pages),
-        dry_run=args.dry_run,
-        fetch_detail=fetch_detail,
-    )
+        stats = sync_disputes(
+            account=account,
+            start_time=start_time,
+            end_time=end_time,
+            dispute_state=args.dispute_state.strip(),
+            page_size=page_size,
+            max_pages=max(0, args.max_pages),
+            dry_run=args.dry_run,
+            fetch_detail=fetch_detail,
+        )
 
-    logger.info(
-        "完成：pages=%s api_items=%s detail_calls=%s empty_dispute_id=%s db_insert_or_update=%s db_skipped=%s",
-        stats.get("pages", 0),
-        stats.get("api_items", 0),
-        stats.get("detail_calls", 0),
-        stats.get("empty_dispute_id", 0),
-        stats.get("db_insert_or_update", 0),
-        stats.get("db_skipped", 0),
-    )
+        logger.info(
+            "账号 %s 完成：pages=%s api_items=%s detail_calls=%s empty_dispute_id=%s db_insert_or_update=%s db_skipped=%s",
+            account.name,
+            stats.get("pages", 0),
+            stats.get("api_items", 0),
+            stats.get("detail_calls", 0),
+            stats.get("empty_dispute_id", 0),
+            stats.get("db_insert_or_update", 0),
+            stats.get("db_skipped", 0),
+        )
+        log_account_egress_ip(account)
 
 
 if __name__ == "__main__":
