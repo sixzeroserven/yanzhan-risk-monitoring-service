@@ -18,6 +18,17 @@
 - PAYPAL_DISPUTE_PAGE_SIZE=50
 - PAYPAL_DISPUTE_LOOKBACK_DAYS=（不设且未传 --start-time 时，默认用接口允许的最早起点：当前时刻起往回 180 天；若设为数字则按最近 N 天，N 最大 180）
 - PAYPAL_DISPUTE_STATE=
+- PAYPAL_DISPUTE_HTTP_CONNECT_TIMEOUT（连接超时秒数，默认 30）
+- PAYPAL_DISPUTE_HTTP_READ_TIMEOUT（读取超时秒数，默认 120）
+- PAYPAL_DISPUTE_HTTP_RETRIES（超时/连接失败/429/5xx 重试次数，默认 8）
+- PAYPAL_DISPUTE_HTTP_RETRY_BASE_DELAY_SECONDS（重试初始等待秒数，默认 5）
+- PAYPAL_DISPUTE_RATE_LIMIT_BASE_DELAY_SECONDS（429 无 Retry-After 时的初始等待秒数，默认 60）
+- PAYPAL_DISPUTE_RATE_LIMIT_MAX_DELAY_SECONDS（429 最大等待秒数，默认 900）
+- PAYPAL_DISPUTE_DETAIL_DELAY_SECONDS（每次详情请求前等待秒数，默认 2）
+- PAYPAL_DISPUTE_DETAIL_HTTP_RETRIES（详情接口失败重试次数，默认 1；失败则记录 dispute_id 并跳过详情）
+- PAYPAL_DISPUTE_DETAIL_FAILED_LOG（详情失败 dispute_id 记录文件，默认 logs/paypal_dispute_detail_failed_ids.log）
+- PAYPAL_DISPUTE_DETAIL_READ_TIMEOUT（详情接口读取超时秒数，默认 30）
+- PAYPAL_DISPUTE_STOP_DETAIL_ON_RATE_LIMIT（详情接口遇到 429 后本轮停止继续调详情，默认 0）
 
 说明：PayPal「列出争议」接口要求 start_time 必须落在最近 180 天内（否则会 INVALID_START_TIME_RANGE），无法通过该接口一次性拉 180 天之前的争议。
 
@@ -39,8 +50,10 @@ import argparse
 import json
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pymysql
@@ -70,57 +83,12 @@ MYSQL_CONFIG = {
 
 PAGE_SIZE_DEFAULT = int(os.getenv("PAYPAL_DISPUTE_PAGE_SIZE", "50") or "50")
 # https://developer.paypal.com/docs/api/customer-disputes/v1/ — start_time 必须在最近 180 天内。
-PAYPAL_LIST_START_MAX_LOOKBACK_DAYS = 180
+PAYPAL_LIST_START_MAX_LOOKBACK_DAYS = 179
 DEFAULT_DISPUTE_STATE = (os.getenv("PAYPAL_DISPUTE_STATE") or "").strip()
 
 # 列表接口时间窗外需按 ID 补拉详情的争议（维护在此元组即可）
 BUILTIN_DISPUTE_IDS_BACKFILL: Tuple[str, ...] = (
-    "PP-R-BPP-576108228",
-    "PP-R-PTR-577158064",
-    "PP-R-YAA-577290787",
-    "PP-R-OWV-577291017",
-    "PP-R-NAY-577473717",
-    "PP-R-EEY-577592148",
-    "PP-R-AWI-577617874",
-    "PP-R-VPZ-577668191",
-    "PP-R-XIX-577887078",
-    "PP-R-ZGY-578068594",
-    "PP-R-BRC-578335810",
-    "PP-R-YIG-578850829",
-    "PP-R-QCT-579216967",
-    "PP-R-FYZ-579222547",
-    "PP-R-AVE-579376691",
-    "PP-R-ILV-579616252",
-    "PP-R-UUB-579805003",
-    "PP-R-NYP-579911317",
-    "PP-R-FNX-580022889",
-    "PP-R-EMV-580068071",
-    "PP-R-WBB-580068077",
-    "PP-R-OWF-580080970",
-    "PP-R-ENF-580724488",
-    "PP-R-HKL-580855881",
-    "PP-R-DEB-580859361",
-    "PP-R-QLQ-581047357",
-    "PP-R-UCF-581214656",
-    "PP-R-DAP-581773747",
-    "PP-R-WJQ-582295857",
-    "PP-R-KII-582391042",
-    "PP-R-XXH-582393618",
-    "PP-R-OAJ-582450697",
-    "PP-R-KIM-582558884",
-    "PP-R-WXY-582571039",
-    "PP-R-LZC-582625785",
-    "PP-R-ZMS-582712108",
-    "PP-R-JAK-582733958",
-    "PP-R-TRA-583148840",
-    "PP-R-SAQ-583148875",
-    "PP-R-CCL-583863612",
-    "PP-R-SFZ-583988470",
-    "PP-R-LIL-584551107",
-    "PP-R-BZV-585770147",
-    "PP-R-RJD-586479401",
-    "PP-R-JWF-588064698",
-    "PP-R-IIP-601902467",
+"PP-R-HOL-629579591",
 )
 
 
@@ -132,6 +100,177 @@ def default_lookback_days_from_env() -> Optional[int]:
         return int(raw)
     except ValueError:
         return None
+
+
+def dispute_http_connect_timeout() -> float:
+    raw = (os.getenv("PAYPAL_DISPUTE_HTTP_CONNECT_TIMEOUT") or "30").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        v = 30.0
+    return max(5.0, min(v, 120.0))
+
+
+def dispute_http_read_timeout() -> float:
+    raw = (os.getenv("PAYPAL_DISPUTE_HTTP_READ_TIMEOUT") or "120").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        v = 120.0
+    return max(30.0, min(v, 900.0))
+
+
+def dispute_http_retries() -> int:
+    raw = (os.getenv("PAYPAL_DISPUTE_HTTP_RETRIES") or "8").strip()
+    try:
+        v = int(raw)
+    except ValueError:
+        v = 8
+    return max(1, min(v, 15))
+
+
+def dispute_http_retry_base_delay_seconds() -> float:
+    raw = (os.getenv("PAYPAL_DISPUTE_HTTP_RETRY_BASE_DELAY_SECONDS") or "5").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        v = 5.0
+    return max(1.0, min(v, 300.0))
+
+
+def dispute_rate_limit_base_delay_seconds() -> float:
+    raw = (os.getenv("PAYPAL_DISPUTE_RATE_LIMIT_BASE_DELAY_SECONDS") or "60").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        v = 60.0
+    return max(1.0, min(v, 3600.0))
+
+
+def dispute_rate_limit_max_delay_seconds() -> float:
+    raw = (os.getenv("PAYPAL_DISPUTE_RATE_LIMIT_MAX_DELAY_SECONDS") or "900").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        v = 900.0
+    return max(1.0, min(v, 7200.0))
+
+
+def dispute_detail_delay_seconds() -> float:
+    raw = (os.getenv("PAYPAL_DISPUTE_DETAIL_DELAY_SECONDS") or "2").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        v = 2.0
+    return max(0.0, min(v, 300.0))
+
+
+def dispute_detail_http_retries() -> int:
+    raw = (os.getenv("PAYPAL_DISPUTE_DETAIL_HTTP_RETRIES") or "1").strip()
+    try:
+        v = int(raw)
+    except ValueError:
+        v = 1
+    return max(1, min(v, 5))
+
+
+def dispute_detail_read_timeout() -> float:
+    raw = (os.getenv("PAYPAL_DISPUTE_DETAIL_READ_TIMEOUT") or "30").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        v = 30.0
+    return max(5.0, min(v, 900.0))
+
+
+def dispute_detail_failed_log_path() -> str:
+    return (os.getenv("PAYPAL_DISPUTE_DETAIL_FAILED_LOG") or "logs/paypal_dispute_detail_failed_ids.log").strip()
+
+
+def dispute_stop_detail_on_rate_limit() -> bool:
+    raw = (os.getenv("PAYPAL_DISPUTE_STOP_DETAIL_ON_RATE_LIMIT") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "y", "on")
+
+
+def retry_after_delay_seconds(response: requests.Response) -> Optional[float]:
+    raw = (response.headers.get("Retry-After") or "").strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        retry_at = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    return max(0.0, (retry_at.astimezone(timezone.utc) - now_utc()).total_seconds())
+
+
+def paypal_request_with_retries(
+    session: requests.Session,
+    method: str,
+    url: str,
+    *,
+    context: str,
+    max_attempts: Optional[int] = None,
+    **kwargs: Any,
+) -> requests.Response:
+    timeout = kwargs.pop("timeout", (dispute_http_connect_timeout(), dispute_http_read_timeout()))
+    attempts = max_attempts if max_attempts is not None else dispute_http_retries()
+    attempts = max(1, min(int(attempts), 15))
+    base_delay = dispute_http_retry_base_delay_seconds()
+    rate_limit_base_delay = dispute_rate_limit_base_delay_seconds()
+    rate_limit_max_delay = dispute_rate_limit_max_delay_seconds()
+
+    for attempt in range(1, attempts + 1):
+        try:
+            response = session.request(method, url, timeout=timeout, **kwargs)
+            if response.status_code == 429:
+                if attempt >= attempts:
+                    return response
+                retry_after = retry_after_delay_seconds(response)
+                delay = retry_after if retry_after is not None else min(rate_limit_max_delay, rate_limit_base_delay * (2 ** (attempt - 1)))
+                logger.warning(
+                    "%s 请求触发限流 429 (第 %s/%s 次)，%.0fs 后重试：body=%s",
+                    context,
+                    attempt,
+                    attempts,
+                    delay,
+                    response.text[:800],
+                )
+                time.sleep(delay)
+                continue
+            if 500 <= response.status_code < 600:
+                if attempt >= attempts:
+                    return response
+                delay = min(120.0, base_delay * (2 ** (attempt - 1)))
+                logger.warning(
+                    "%s 请求返回 status=%s (第 %s/%s 次)，%.0fs 后重试：body=%s",
+                    context,
+                    response.status_code,
+                    attempt,
+                    attempts,
+                    delay,
+                    response.text[:800],
+                )
+                time.sleep(delay)
+                continue
+            return response
+        except (
+            requests.exceptions.ReadTimeout,
+            requests.exceptions.ConnectTimeout,
+            requests.exceptions.ConnectionError,
+        ) as exc:
+            if attempt >= attempts:
+                raise
+            delay = min(120.0, base_delay * (2 ** (attempt - 1)))
+            logger.warning("%s 请求超时或连接失败 (第 %s/%s 次)，%.0fs 后重试：%s", context, attempt, attempts, delay, exc)
+            time.sleep(delay)
+
+    raise RuntimeError(f"{context} 请求未返回响应")  # pragma: no cover
 
 
 def clamp_page_size(size: int) -> int:
@@ -212,12 +351,14 @@ def resolve_time_window(
 
 def get_access_token(session: requests.Session, account: PayPalAccount) -> str:
     url = f"{account.base_url}/v1/oauth2/token"
-    response = session.post(
+    response = paypal_request_with_retries(
+        session,
+        "POST",
         url,
         data={"grant_type": "client_credentials"},
         auth=(account.client_id, account.client_secret),
         headers={"Accept": "application/json", "Accept-Language": "en_US"},
-        timeout=60,
+        context="PayPal OAuth2",
     )
     if response.status_code >= 400:
         logger.error("获取 PayPal access_token 失败：status=%s body=%s", response.status_code, response.text[:600])
@@ -469,14 +610,57 @@ def fetch_dispute_detail(
     headers: Dict[str, str],
     dispute_id: str,
     base_url: str,
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], Optional[str]]:
     url = f"{base_url}/v1/customer/disputes/{dispute_id}"
-    response = session.get(url, headers=headers, timeout=60)
+    try:
+        response = paypal_request_with_retries(
+            session,
+            "GET",
+            url,
+            headers=headers,
+            context=f"PayPal dispute detail {dispute_id}",
+            max_attempts=dispute_detail_http_retries(),
+            timeout=(dispute_http_connect_timeout(), dispute_detail_read_timeout()),
+        )
+    except requests.RequestException as exc:
+        logger.warning("拉取争议详情超时/连接失败，记录并跳过 detail dispute_id=%s error=%s", dispute_id, exc)
+        return {}, f"request_error:{type(exc).__name__}"
     if response.status_code >= 400:
-        logger.warning("拉取争议详情失败 dispute_id=%s status=%s", dispute_id, response.status_code)
-        return {}
-    data = response.json()
-    return data if isinstance(data, dict) else {}
+        logger.warning("拉取争议详情失败，记录并跳过 detail dispute_id=%s status=%s body=%s", dispute_id, response.status_code, response.text[:600])
+        return {}, f"http_{response.status_code}"
+    try:
+        data = response.json()
+    except ValueError:
+        logger.warning("拉取争议详情返回非 JSON，记录并跳过 detail dispute_id=%s body=%s", dispute_id, response.text[:600])
+        return {}, "invalid_json"
+    return (data if isinstance(data, dict) else {}), None
+
+
+def record_detail_failures(account: PayPalAccount, stats: Dict[str, Any]) -> None:
+    failed_ids = stats.get("detail_failed_ids")
+    if not isinstance(failed_ids, list) or not failed_ids:
+        return
+
+    reasons = stats.get("detail_failed_reasons")
+    if not isinstance(reasons, dict):
+        reasons = {}
+    logger.warning("账号 %s 跳过 %s 条争议详情，失败 dispute_id 如下：", account.name, len(failed_ids))
+    chunk_size = 50
+    for idx in range(0, len(failed_ids), chunk_size):
+        chunk = ",".join(str(x) for x in failed_ids[idx : idx + chunk_size])
+        logger.warning("账号 %s 失败 dispute_id[%s-%s]=%s", account.name, idx + 1, min(idx + chunk_size, len(failed_ids)), chunk)
+
+    path = dispute_detail_failed_log_path()
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        ts = now_utc().isoformat(timespec="seconds")
+        with open(path, "a", encoding="utf-8") as fh:
+            for dispute_id in failed_ids:
+                fh.write(f"{ts}\t{account.name}\t{dispute_id}\t{reasons.get(dispute_id, '')}\n")
+    except OSError as exc:
+        logger.warning("写入争议详情失败记录文件失败 path=%s error=%s", path, exc)
 
 
 def list_disputes(
@@ -492,7 +676,16 @@ def list_disputes(
 ) -> Tuple[List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]], Dict[str, int]]:
     endpoint = f"{base_url}/v1/customer/disputes"
     rows: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = []
-    stats = {"pages": 0, "api_items": 0, "detail_calls": 0, "empty_dispute_id": 0}
+    stats: Dict[str, Any] = {
+        "pages": 0,
+        "api_items": 0,
+        "detail_calls": 0,
+        "detail_fetch_failed": 0,
+        "detail_failed_ids": [],
+        "detail_failed_reasons": {},
+        "detail_disabled_reason": "",
+        "empty_dispute_id": 0,
+    }
 
     page = 1
     next_page_token = ""
@@ -510,7 +703,14 @@ def list_disputes(
         if next_page_token:
             params["next_page_token"] = next_page_token
 
-        response = session.get(endpoint, headers=headers, params=params, timeout=60)
+        response = paypal_request_with_retries(
+            session,
+            "GET",
+            endpoint,
+            headers=headers,
+            params=params,
+            context="PayPal disputes list",
+        )
         if response.status_code >= 400:
             logger.error(
                 "请求 PayPal disputes 列表失败: status=%s params=%s body=%s",
@@ -541,9 +741,17 @@ def list_disputes(
 
             detail_opt: Optional[Dict[str, Any]] = None
             if fetch_detail:
-                detail_opt = fetch_dispute_detail(session, headers, dispute_id, base_url)
+                detail_delay = dispute_detail_delay_seconds()
+                if detail_delay > 0:
+                    time.sleep(detail_delay)
+                detail_opt, failure_reason = fetch_dispute_detail(session, headers, dispute_id, base_url)
                 stats["detail_calls"] += 1
                 if not detail_opt or not pick_str(detail_opt, "dispute_id", "id"):
+                    stats["detail_fetch_failed"] += 1
+                    stats["detail_failed_ids"].append(dispute_id)
+                    stats["detail_failed_reasons"][dispute_id] = failure_reason or "empty_detail"
+                    if failure_reason == "http_429" and dispute_stop_detail_on_rate_limit():
+                        logger.warning("详情接口遇到 429，已记录 dispute_id；当前配置仍会继续尝试后续争议详情")
                     detail_opt = None
             rows.append((item, detail_opt))
 
@@ -566,16 +774,32 @@ def list_disputes(
 
 
 def parse_dispute_id_list(raw: str) -> List[str]:
-    """逗号/换行分隔的 dispute_id，去空白、去重（保序）。"""
+    """逗号/换行分隔的 dispute_id，去空白、去重（保序）。
+
+    支持在文件中用 # 写注释；同一行也可以写逗号分隔的多个 ID。
+    """
     seen: Set[str] = set()
     out: List[str] = []
-    for chunk in raw.replace("\n", ",").split(","):
-        s = chunk.strip()
-        if not s or s in seen:
+    for line in raw.splitlines():
+        content = line.split("#", 1)[0].strip()
+        if not content:
             continue
-        seen.add(s)
-        out.append(s)
+        for chunk in content.split(","):
+            s = chunk.strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
     return out
+
+
+def parse_dispute_id_file(path: str) -> List[str]:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return parse_dispute_id_list(fh.read())
+    except OSError as exc:
+        logger.error("读取 dispute_id 文件失败 path=%s error=%s", path, exc)
+        raise SystemExit(1)
 
 
 def persist_dispute_rows(rows: List[Dict[str, Any]], dry_run: bool, stats: Dict[str, int]) -> None:
@@ -607,14 +831,16 @@ def persist_dispute_rows(rows: List[Dict[str, Any]], dry_run: bool, stats: Dict[
         conn.close()
 
 
-def sync_disputes_by_ids(dispute_ids: List[str], dry_run: bool, account: PayPalAccount) -> Dict[str, int]:
+def sync_disputes_by_ids(dispute_ids: List[str], dry_run: bool, account: PayPalAccount) -> Dict[str, Any]:
     """仅 GET /v1/customer/disputes/{id} 并 upsert，用于列表接口时间窗口外的争议。"""
-    stats: Dict[str, int] = {
+    stats: Dict[str, Any] = {
         "pages": 0,
         "api_items": len(dispute_ids),
         "detail_calls": 0,
         "empty_dispute_id": 0,
         "detail_fetch_failed": 0,
+        "detail_failed_ids": [],
+        "detail_failed_reasons": {},
         "db_insert_or_update": 0,
         "db_skipped": 0,
     }
@@ -628,10 +854,12 @@ def sync_disputes_by_ids(dispute_ids: List[str], dry_run: bool, account: PayPalA
 
     rows: List[Dict[str, Any]] = []
     for did in dispute_ids:
-        detail_opt = fetch_dispute_detail(session, headers, did, account.base_url)
+        detail_opt, failure_reason = fetch_dispute_detail(session, headers, did, account.base_url)
         stats["detail_calls"] += 1
         if not detail_opt or not pick_str(detail_opt, "dispute_id", "id"):
             stats["detail_fetch_failed"] += 1
+            stats["detail_failed_ids"].append(did)
+            stats["detail_failed_reasons"][did] = failure_reason or "empty_detail"
             logger.warning("按 ID 拉取争议详情失败 dispute_id=%s", did)
             continue
 
@@ -645,6 +873,7 @@ def sync_disputes_by_ids(dispute_ids: List[str], dry_run: bool, account: PayPalA
         row["buyer_evidence_notes"] = extract_buyer_evidence_notes(detail_opt)
         rows.append(row)
 
+    record_detail_failures(account, stats)
     persist_dispute_rows(rows, dry_run, stats)
     return stats
 
@@ -658,7 +887,7 @@ def sync_disputes(
     max_pages: int,
     dry_run: bool,
     fetch_detail: bool,
-) -> Dict[str, int]:
+) -> Dict[str, Any]:
     session = make_paypal_session(account)
     token = get_access_token(session, account)
     headers = {
@@ -693,6 +922,7 @@ def sync_disputes(
         row["buyer_evidence_notes"] = extract_buyer_evidence_notes(detail_opt)
         rows.append(row)
 
+    record_detail_failures(account, stats)
     persist_dispute_rows(rows, dry_run, stats)
     return stats
 
@@ -732,6 +962,11 @@ def main() -> None:
         help="逗号分隔 dispute_id，仅 GET 详情并 upsert（跳过列表时间窗口）",
     )
     parser.add_argument(
+        "--dispute-ids-file",
+        default="",
+        help="从文件读取 dispute_id（支持每行一个、逗号分隔、# 注释），仅 GET 详情并 upsert",
+    )
+    parser.add_argument(
         "--backfill-builtin-dispute-ids",
         action="store_true",
         help="使用脚本内建 BUILTIN_DISPUTE_IDS_BACKFILL 仅拉详情并 upsert",
@@ -744,6 +979,19 @@ def main() -> None:
     args = parser.parse_args()
     accounts = select_paypal_accounts(args.paypal_account)
 
+    id_sources = sum(
+        1
+        for enabled in (
+            bool((args.dispute_ids or "").strip()),
+            bool((args.dispute_ids_file or "").strip()),
+            bool(args.backfill_builtin_dispute_ids),
+        )
+        if enabled
+    )
+    if id_sources > 1:
+        logger.error("--dispute-ids / --dispute-ids-file / --backfill-builtin-dispute-ids 只能三选一")
+        raise SystemExit(1)
+
     if args.backfill_builtin_dispute_ids:
         ids = list(BUILTIN_DISPUTE_IDS_BACKFILL)
         for account in accounts:
@@ -752,6 +1000,35 @@ def main() -> None:
                 account.name,
                 account.base_url,
                 mask_proxy_url(account.proxy_url),
+                len(ids),
+                args.dry_run,
+            )
+            stats = sync_disputes_by_ids(ids, dry_run=args.dry_run, account=account)
+            logger.info(
+                "账号 %s 完成：detail_calls=%s detail_fetch_failed=%s empty_dispute_id=%s db_insert_or_update=%s db_skipped=%s",
+                account.name,
+                stats.get("detail_calls", 0),
+                stats.get("detail_fetch_failed", 0),
+                stats.get("empty_dispute_id", 0),
+                stats.get("db_insert_or_update", 0),
+                stats.get("db_skipped", 0),
+            )
+            log_account_egress_ip(account)
+        return
+
+    ids_file = (args.dispute_ids_file or "").strip()
+    if ids_file:
+        ids = parse_dispute_id_file(ids_file)
+        if not ids:
+            logger.error("--dispute-ids-file 解析后为空：%s", ids_file)
+            raise SystemExit(1)
+        for account in accounts:
+            logger.info(
+                "按 dispute_id 文件仅拉详情：account=%s base=%s proxy=%s file=%s count=%s dry_run=%s",
+                account.name,
+                account.base_url,
+                mask_proxy_url(account.proxy_url),
+                ids_file,
                 len(ids),
                 args.dry_run,
             )
@@ -839,11 +1116,12 @@ def main() -> None:
         )
 
         logger.info(
-            "账号 %s 完成：pages=%s api_items=%s detail_calls=%s empty_dispute_id=%s db_insert_or_update=%s db_skipped=%s",
+            "账号 %s 完成：pages=%s api_items=%s detail_calls=%s detail_fetch_failed=%s empty_dispute_id=%s db_insert_or_update=%s db_skipped=%s",
             account.name,
             stats.get("pages", 0),
             stats.get("api_items", 0),
             stats.get("detail_calls", 0),
+            stats.get("detail_fetch_failed", 0),
             stats.get("empty_dispute_id", 0),
             stats.get("db_insert_or_update", 0),
             stats.get("db_skipped", 0),
