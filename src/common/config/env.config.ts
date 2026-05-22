@@ -13,6 +13,7 @@ export type ShoplazzaGlobalConfig = {
   timeoutMs: number;
   insecureTls: boolean;
   autoSubscribeWebhook: boolean;
+  confirmNoteWrite: boolean;
   apiVersion: string;
   subscribeWebhookPathTemplate: string;
   webhookCallbackUrl: string;
@@ -63,7 +64,11 @@ export class EnvConfig {
     const host = process.env.DB_HOST as string;
     const port = Number(process.env.DB_PORT);
     const database = process.env.DB_NAME as string;
-    return `mysql://${user}:${password}@${host}:${port}/${database}`;
+    const params = new URLSearchParams({
+      connection_limit: String(Number(process.env.DB_CONNECTION_LIMIT || 10)),
+      pool_timeout: String(Number(process.env.DB_POOL_TIMEOUT_SECONDS || 20))
+    });
+    return `mysql://${user}:${password}@${host}:${port}/${database}?${params.toString()}`;
   }
   get shoplazza() {
     return {
@@ -73,6 +78,7 @@ export class EnvConfig {
       timeoutMs: Number(process.env.SHOPLAZZA_TIMEOUT_MS || 10000),
       insecureTls: String(process.env.SHOPLAZZA_INSECURE_TLS || "false") === "true",
       autoSubscribeWebhook: String(process.env.SHOPLAZZA_AUTO_SUBSCRIBE_WEBHOOK || "false") === "true",
+      confirmNoteWrite: String(process.env.SHOPLAZZA_CONFIRM_NOTE_WRITE || "false") === "true",
       apiVersion: process.env.SHOPLAZZA_API_VERSION || "2020-07",
       subscribeWebhookPathTemplate:
         process.env.SHOPLAZZA_SUBSCRIBE_WEBHOOK_PATH_TEMPLATE || "/openapi/{version}/webhooks/subscribe",
@@ -110,6 +116,7 @@ export class EnvConfig {
       timeoutMs: config.timeoutMs,
       insecureTls: config.insecureTls,
       autoSubscribeWebhook: config.autoSubscribeWebhook,
+      confirmNoteWrite: config.confirmNoteWrite,
       apiVersion: config.apiVersion,
       subscribeWebhookPathTemplate: config.subscribeWebhookPathTemplate,
       webhookCallbackUrl: config.webhookCallbackUrl,

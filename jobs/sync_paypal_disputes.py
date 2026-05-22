@@ -508,7 +508,7 @@ def ensure_table(cursor) -> None:
             KEY idx_state (dispute_state),
             KEY idx_update_time (update_time),
             KEY idx_buyer_tx (buyer_transaction_id),
-            KEY idx_seller_tx (seller_transaction_id),
+            KEY idx_paypal_disputes_seller_tx (seller_transaction_id),
             KEY idx_invoice_id (invoice_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """

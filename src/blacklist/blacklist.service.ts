@@ -1,4 +1,4 @@
-import { Injectable } from "@nestjs/common";
+import { Injectable, Logger } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
 import {
   getDeviceFingerprint,
@@ -16,8 +16,21 @@ export interface BlacklistHit {
   hit_value: string;
 }
 
+export type ScoreExclusionReason = "non_regular_email" | "dispute_user";
+
+export interface ScoreExclusionResult {
+  excluded: boolean;
+  reason: ScoreExclusionReason | null;
+  remark: string;
+  email: string;
+  details?: Record<string, unknown>;
+  hits?: Array<Record<string, unknown>>;
+}
+
 @Injectable()
 export class BlacklistService {
+  private readonly logger = new Logger(BlacklistService.name);
+
   constructor(private readonly db: DatabaseService) {}
 
   async checkByInput(input: Record<string, unknown>) {
@@ -75,6 +88,38 @@ export class BlacklistService {
       fingerprint: safeString(getDeviceFingerprint(order))
     };
     return this.checkByContact(contact);
+  }
+
+  async checkScoreExclusionByOrder(order: Record<string, unknown>): Promise<ScoreExclusionResult> {
+    const email = this.extractEmailFromOrder(order);
+
+    const nonRegularEmail = this.checkNonRegularEmail(email);
+    if (nonRegularEmail.excluded) return nonRegularEmail;
+
+    const disputeHits = await this.findDisputesByEmail(email);
+    if (disputeHits.length > 0) {
+      const first = disputeHits[0];
+      const disputeId = safeString(first.dispute_id);
+      const transactionId = safeString(first.seller_transaction_id);
+      const orderId = safeString(first.order_id);
+      const remarkParts = [
+        `⚠️【不参与评分】争议用户：该邮箱关联 PayPal 争议订单`,
+        disputeId ? `争议ID ${disputeId}` : "",
+        transactionId ? `交易号 ${transactionId}` : "",
+        orderId ? `关联订单 ${orderId}` : "",
+        `不参与评分。`
+      ].filter(Boolean);
+
+      return {
+        excluded: true,
+        reason: "dispute_user",
+        remark: remarkParts.join("，"),
+        email,
+        hits: disputeHits
+      };
+    }
+
+    return { excluded: false, reason: null, remark: "", email };
   }
 
   async markOrderAsBlacklisted(order: Record<string, unknown>) {
@@ -178,29 +223,184 @@ export class BlacklistService {
     address2: string;
     fingerprint: string;
   }) {
-    const blacklistedOrders = await this.getBlacklistedOrders();
-    if (!blacklistedOrders.length) return { blocked: false, contact, hits: [] };
-
-    const [emailHits, phoneNumberHits, detailAddressHits, address2Hits, fingerprintHits] = await Promise.all([
-      this.findByEmail(contact.email),
-      this.findByPhoneNumber(contact.phoneNumber),
-      this.findByDetailAddress(contact.detailAddress),
-      this.findByAddress2(contact.address2),
-      this.findByFingerprint(contact.fingerprint)
-    ]);
-    const hits = [...emailHits, ...phoneNumberHits, ...detailAddressHits, ...address2Hits, ...fingerprintHits];
+    const hits: BlacklistHit[] = [];
+    hits.push(...(await this.findByEmail(contact.email)));
+    hits.push(...(await this.findByPhoneNumber(contact.phoneNumber)));
+    hits.push(...(await this.findByDetailAddress(contact.detailAddress)));
+    hits.push(...(await this.findByAddress2(contact.address2)));
+    hits.push(...(await this.findByFingerprint(contact.fingerprint)));
     return { blocked: hits.length > 0, contact, hits };
   }
 
-  private async getBlacklistedOrders(): Promise<Array<{ id: number; order_id: string; package_number: string }>> {
-    const rows = await this.db.$queryRawUnsafe(
-      `
-      SELECT o.id, o.order_id, o.package_number
-      FROM orders o
-      WHERE o.black_state = 1
-    `
+  private extractEmailFromOrder(order: Record<string, unknown>): string {
+    const shipping = this.asObject(order.shipping_address);
+    const billing = this.asObject(order.billing_address);
+    const customer = this.asObject(order.customer);
+    return normalizeEmail(
+      this.pickFirstString(
+        order.email,
+        order.contact_email,
+        customer.email,
+        customer.contact_email,
+        shipping.email,
+        billing.email,
+        this.findFirstDeepString(order, new Set(["email", "contact_email", "buyer_account"]))
+      )
     );
-    return rows as Array<{ id: number; order_id: string; package_number: string }>;
+  }
+
+  private checkNonRegularEmail(email: string): ScoreExclusionResult {
+    if (!email) {
+      return {
+        excluded: true,
+        reason: "non_regular_email",
+        remark: "⚠️【不参与评分】非常规邮箱：订单未提供有效邮箱，不参与评分。",
+        email,
+        details: { rule: "empty_email" }
+      };
+    }
+
+    const atCount = (email.match(/@/g) || []).length;
+    const [localPart, domain] = email.split("@");
+    if (
+      atCount !== 1 ||
+      !localPart ||
+      !domain ||
+      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
+      domain.startsWith(".") ||
+      domain.endsWith(".")
+    ) {
+      return {
+        excluded: true,
+        reason: "non_regular_email",
+        remark: `⚠️【不参与评分】非常规邮箱：邮箱 ${email} 格式异常，不参与评分。`,
+        email,
+        details: { rule: "invalid_format" }
+      };
+    }
+
+    const configuredDomains = this.configuredNonRegularEmailDomains();
+    const disposableDomainTokens = [
+      "10minutemail",
+      "tempmail",
+      "temp-mail",
+      "mailinator",
+      "guerrillamail",
+      "yopmail",
+      "trashmail",
+      "sharklasers",
+      "dispostable",
+      "getnada",
+      "maildrop"
+    ];
+    const matchedDomain =
+      configuredDomains.find((item) => domain === item || domain.endsWith(`.${item}`)) ||
+      disposableDomainTokens.find((item) => domain.includes(item));
+    if (matchedDomain) {
+      return {
+        excluded: true,
+        reason: "non_regular_email",
+        remark: `⚠️【不参与评分】非常规邮箱：邮箱 ${email} 命中临时/异常邮箱域名 ${matchedDomain}，不参与评分。`,
+        email,
+        details: { rule: "domain", matchedDomain }
+      };
+    }
+
+    const localLower = localPart.toLowerCase();
+    const suspiciousLocalParts = ["test", "fake", "noreply", "no-reply", "donotreply", "do-not-reply"];
+    const matchedLocalPart = suspiciousLocalParts.find(
+      (item) => localLower === item || localLower.startsWith(`${item}+`)
+    );
+    if (matchedLocalPart) {
+      return {
+        excluded: true,
+        reason: "non_regular_email",
+        remark: `⚠️【不参与评分】非常规邮箱：邮箱 ${email} 命中异常邮箱名称 ${matchedLocalPart}，不参与评分。`,
+        email,
+        details: { rule: "local_part", matchedLocalPart }
+      };
+    }
+
+    return { excluded: false, reason: null, remark: "", email };
+  }
+
+  private async findDisputesByEmail(email: string): Promise<Array<Record<string, unknown>>> {
+    if (!email) return [];
+    const startedAt = Date.now();
+    try {
+      const orderRows = (await this.db.$queryRawUnsafe(
+        `
+        SELECT DISTINCT
+          o.order_id,
+          o.transaction_id
+        FROM order_address oa
+        INNER JOIN orders o ON o.order_id = oa.order_id
+        WHERE oa.email = ?
+          AND o.transaction_id IS NOT NULL
+          AND o.transaction_id <> ''
+        LIMIT 50
+      `,
+        email
+      )) as Array<Record<string, unknown>>;
+
+      if (orderRows.length === 0) {
+        this.logger.log(`争议用户查询完成：email=${email} transactions=0 hits=0 durationMs=${Date.now() - startedAt}`);
+        return [];
+      }
+
+      const transactionIds = Array.from(
+        new Set(orderRows.map((row) => safeString(row.transaction_id)).filter(Boolean))
+      );
+      if (transactionIds.length === 0) {
+        this.logger.log(`争议用户查询完成：email=${email} transactions=0 hits=0 durationMs=${Date.now() - startedAt}`);
+        return [];
+      }
+
+      const placeholders = transactionIds.map(() => "?").join(",");
+      const disputeRows = (await this.db.$queryRawUnsafe(
+        `
+        SELECT
+          pd.dispute_id,
+          pd.dispute_state,
+          pd.dispute_stage,
+          pd.dispute_reason,
+          pd.seller_transaction_id,
+          pd.seller_transaction_id AS transaction_id
+        FROM paypal_disputes pd
+        WHERE pd.seller_transaction_id IN (${placeholders})
+        ORDER BY COALESCE(pd.update_time, pd.create_time) DESC
+        LIMIT 20
+      `,
+        ...transactionIds
+      )) as Array<Record<string, unknown>>;
+
+      const orderIdByTransaction = new Map(
+        orderRows.map((row) => [safeString(row.transaction_id), safeString(row.order_id)])
+      );
+      const rows = disputeRows.map((row) => ({
+        ...row,
+        order_id: orderIdByTransaction.get(safeString(row.seller_transaction_id)) || ""
+      }));
+      this.logger.log(
+        `争议用户查询完成：email=${email} transactions=${transactionIds.length} hits=${rows.length} durationMs=${Date.now() - startedAt}`
+      );
+      return rows;
+    } catch (error) {
+      this.logger.warn(`争议用户检查跳过：email=${email} durationMs=${Date.now() - startedAt} error=${this.formatError(error)}`);
+      return [];
+    }
+  }
+
+  private configuredNonRegularEmailDomains(): string[] {
+    return safeString(process.env.NON_REGULAR_EMAIL_DOMAINS || process.env.IRREGULAR_EMAIL_DOMAINS)
+      .split(",")
+      .map((item) => item.trim().toLowerCase())
+      .filter(Boolean);
+  }
+
+  private formatError(error: unknown): string {
+    if (error instanceof Error) return error.message;
+    return String(error);
   }
 
   private async findByEmail(email: string): Promise<BlacklistHit[]> {

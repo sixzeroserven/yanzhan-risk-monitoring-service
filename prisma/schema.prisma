@@ -50,6 +50,7 @@ model Order {
 
   @@unique([orderId, packageNumber], map: "uk_order_package")
   @@index([orderId], map: "idx_order_id")
+  @@index([transactionId], map: "idx_orders_transaction_id")
   @@index([packageNumber], map: "idx_package_number")
   @@map("orders")
 }

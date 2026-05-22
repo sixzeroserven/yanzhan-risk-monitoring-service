@@ -79,36 +79,8 @@ export class WebhooksController {
     return this.handleOrderWebhook("orders/update", req, body, hmac, shopDomain, fallbackShopDomain);
   }
 
-  @Post("create")
-  @ApiOperation({ summary: "处理 Shoplazza orders/create webhook" })
-  @ApiHeader({
-    name: "x-shoplazza-hmac-sha256",
-    required: true,
-    description: "Webhook HMAC 签名"
-  })
-  @ApiBody({
-    schema: {
-      type: "object",
-      required: ["id"],
-      properties: {
-        id: { oneOf: [{ type: "string" }, { type: "number" }], example: "ORDER_20001" },
-        order_id: { oneOf: [{ type: "string" }, { type: "number" }], example: "ORDER_20001" },
-        order_number: { oneOf: [{ type: "string" }, { type: "number" }], example: "ORDER_20001" }
-      }
-    }
-  })
-  async handleOrderCreate(
-    @Req() req: Request & { rawBody?: Buffer },
-    @Body() body: Record<string, unknown>,
-    @Headers("x-shoplazza-hmac-sha256") hmac?: string,
-    @Headers("x-shoplazza-shop-domain") shopDomain?: string,
-    @Headers("x-shop-domain") fallbackShopDomain?: string
-  ) {
-    return this.handleOrderWebhook("orders/create", req, body, hmac, shopDomain, fallbackShopDomain);
-  }
-
   private async handleOrderWebhook(
-    topic: "orders/create" | "orders/update",
+    topic: "orders/update",
     req: Request & { rawBody?: Buffer },
     body: Record<string, unknown>,
     hmac?: string,

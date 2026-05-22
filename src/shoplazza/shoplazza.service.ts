@@ -14,7 +14,7 @@ export class ShoplazzaService implements OnModuleInit {
     if (!this.env.shoplazzaGlobal.autoSubscribeWebhook) return;
     for (const store of this.env.shoplazzaStores) {
       try {
-        const result = await this.ensureOrderUpdateWebhook(store.storeDomain);
+        const result = await this.ensureOrderWebhook("orders/update", store.storeDomain);
         this.logger.log(
           `自动订阅 Shoplazza webhook 成功：store=${store.storeDomain} event=${result.topic} callback=${result.callback_url}`
         );
@@ -33,13 +33,17 @@ export class ShoplazzaService implements OnModuleInit {
   }
 
   private async ensureOrderUpdateWebhook(storeDomain: string) {
-    const expectedAddress = this.resolveCallbackUrl("orders/update");
+    return this.ensureOrderWebhook("orders/update", storeDomain);
+  }
+
+  private async ensureOrderWebhook(topic: string, storeDomain: string) {
+    const expectedAddress = this.resolveCallbackUrl(topic);
     const listed = await this.listWebhooks(storeDomain);
-    const existing = listed.records.find((item) => item.topic === "orders/update");
+    const existing = listed.records.find((item) => item.topic === topic);
     if (existing && existing.address.trim() === expectedAddress.trim()) {
       return {
         success: true,
-        topic: "orders/update",
+        topic,
         callback_url: existing.address,
         api_path: listed.api_path,
         data: existing
@@ -50,10 +54,10 @@ export class ShoplazzaService implements OnModuleInit {
     if (existing?.id) {
       await this.client(storeDomain).delete(`${listed.api_path}/${encodeURIComponent(existing.id)}`);
       this.logger.warn(
-        `检测到 webhook 回调地址不匹配，已删除旧订阅：store=${storeDomain} topic=orders/update old=${existing.address} expected=${expectedAddress}`
+        `检测到 webhook 回调地址不匹配，已删除旧订阅：store=${storeDomain} topic=${topic} old=${existing.address} expected=${expectedAddress}`
       );
     }
-    return this.subscribeOrderWebhook("orders/update", expectedAddress, storeDomain);
+    return this.subscribeOrderWebhook(topic, expectedAddress, storeDomain);
   }
 
   verifyWebhookSignature(rawBody: Buffer, providedHmac?: string, storeDomain?: string): boolean {
@@ -84,45 +88,94 @@ export class ShoplazzaService implements OnModuleInit {
     await this.client(storeDomain).post(this.path(this.env.shoplazzaGlobal.cancelOrderPathTemplate, orderId), { reason });
   }
 
-  async appendOrderNote(orderId: string | number, note: string, storeDomain?: string): Promise<void> {
+  async appendOrderNote(
+    orderId: string | number,
+    note: string,
+    storeDomain?: string,
+    existingNoteFromCaller?: string
+  ): Promise<void> {
     const client = this.client(storeDomain);
-    const paths = this.getOrderWritePaths(orderId);
-    const payloads: Array<Record<string, unknown>> = [
-      { order: { id: orderId, note } },
-      { order: { note } },
-      { note },
-      { remark: note }
+    const existingNote =
+      existingNoteFromCaller === undefined
+        ? await this.readExistingOrderNote(orderId, storeDomain)
+        : this.pickFirstString(existingNoteFromCaller);
+    if (this.hasNoteText(existingNote, note)) {
+      this.logger.log(`订单备注已存在：orderId=${String(orderId)}`);
+      return;
+    }
+
+    const finalNote = existingNote ? `${existingNote}\n${note}` : note;
+    const primaryPath = this.path(this.env.shoplazzaGlobal.updateOrderPathTemplate, orderId);
+    const primaryPayload = { order: { id: orderId, note: finalNote } };
+    const fallbackPaths = this.getOrderWritePaths(orderId).filter((path) => path !== primaryPath);
+    const fallbackPayloads: Array<Record<string, unknown>> = [
+      { order: { note: finalNote } },
+      { note: finalNote },
+      { remark: finalNote }
+    ];
+    const attempts: Array<{ path: string; payload: Record<string, unknown> }> = [
+      { path: primaryPath, payload: primaryPayload },
+      ...fallbackPaths.flatMap((path) => [
+        { path, payload: primaryPayload },
+        ...fallbackPayloads.map((payload) => ({ path, payload }))
+      ])
     ];
 
     let lastError: unknown;
-    for (const path of paths) {
-      for (const payload of payloads) {
-        try {
-          await client.put(path, payload);
-          const readback = await this.getOrderReadback(orderId, storeDomain);
-          const savedNote = this.pickFirstString(
-            readback.order.note,
-            readback.order.order_note,
-            readback.order.customer_note,
-            readback.order.memo
+    for (const attempt of attempts) {
+      const payloadType = this.describeOrderNotePayload(attempt.payload);
+      try {
+        await client.put(attempt.path, attempt.payload);
+        if (!this.env.shoplazzaGlobal.confirmNoteWrite) {
+          this.logger.log(
+            `订单备注写入请求成功：orderId=${String(orderId)} writePath=${attempt.path} payloadType=${payloadType} confirmed=false`
           );
-          if (this.hasNoteText(savedNote, note)) {
-            this.logger.log(
-              `订单备注写入成功：orderId=${String(orderId)}`
-            );
-            return;
-          }
-          lastError = new Error(
-            `备注未落库，writePath=${path} readPath=${readback.usedPath} savedNote=${savedNote || "-"}`
-          );
-        } catch (error) {
-          lastError = error;
+          return;
         }
+        const readback = await this.getOrderReadback(orderId, storeDomain);
+        const savedNote = this.pickFirstString(
+          readback.order.note,
+          readback.order.order_note,
+          readback.order.customer_note,
+          readback.order.memo
+        );
+        if (this.hasNoteText(savedNote, note)) {
+          this.logger.log(
+            `订单备注写入成功：orderId=${String(orderId)} writePath=${attempt.path} payloadType=${payloadType} confirmed=true`
+          );
+          return;
+        }
+        lastError = new Error(
+          `备注未落库，writePath=${attempt.path} readPath=${readback.usedPath} savedNote=${savedNote || "-"}`
+        );
+      } catch (error) {
+        lastError = error;
       }
     }
 
     if (lastError) throw lastError;
     throw new Error("备注写入失败：未知错误");
+  }
+
+  private describeOrderNotePayload(payload: Record<string, unknown>): string {
+    const order = payload.order;
+    if (order && typeof order === "object" && !Array.isArray(order)) {
+      const hasId = Object.prototype.hasOwnProperty.call(order, "id");
+      return hasId ? "order.id+note" : "order.note";
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "note")) return "note";
+    if (Object.prototype.hasOwnProperty.call(payload, "remark")) return "remark";
+    return "unknown";
+  }
+
+  private async readExistingOrderNote(orderId: string | number, storeDomain?: string): Promise<string> {
+    const currentReadback = await this.getOrderReadback(orderId, storeDomain);
+    return this.pickFirstString(
+      currentReadback.order.note,
+      currentReadback.order.order_note,
+      currentReadback.order.customer_note,
+      currentReadback.order.memo
+    );
   }
 
   async getOrderReadback(orderId: string | number, storeDomain?: string): Promise<{
@@ -151,10 +204,6 @@ export class ShoplazzaService implements OnModuleInit {
 
   async subscribeOrderUpdateWebhook(callbackUrl?: string, storeDomain?: string) {
     return this.subscribeOrderWebhook("orders/update", callbackUrl, storeDomain);
-  }
-
-  async subscribeOrderCreateWebhook(callbackUrl?: string, storeDomain?: string) {
-    return this.subscribeOrderWebhook("orders/create", callbackUrl, storeDomain);
   }
 
   async subscribeOrderWebhook(topic: string, callbackUrl?: string, storeDomain?: string) {
