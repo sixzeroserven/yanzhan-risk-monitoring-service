@@ -242,3 +242,5 @@ cp .env.docker.example .env
 脚本路径：`jobs/crawl_orders.py`（请确保 `.env` 中已配置 **`DIANXIAOMI_COOKIE`**）。  
 
 ##在docker中执行脚本docker compose exec app python3 + .....
+## ssh azureuser@20.6.132.23
+./scripts/azure-vm-deploy.sh
