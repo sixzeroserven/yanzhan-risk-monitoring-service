@@ -17,6 +17,7 @@ export interface BlacklistHit {
 }
 
 export type ScoreExclusionReason = "non_regular_email" | "dispute_user";
+export type RiskScoreExcludeReason = ScoreExclusionReason | "blacklist" | "no_order";
 
 export interface ScoreExclusionResult {
   excluded: boolean;
@@ -26,6 +27,101 @@ export interface ScoreExclusionResult {
   details?: Record<string, unknown>;
   hits?: Array<Record<string, unknown>>;
 }
+
+type RiskWeightRange = {
+  min?: number;
+  max?: number;
+  weight: number;
+  includeMin?: boolean;
+  includeMax?: boolean;
+};
+
+type RiskScoreConfig = {
+  paidOrderCount: {
+    min: number;
+    max: number;
+    weights: RiskWeightRange[];
+  };
+  unfinishedRatio: {
+    min: number;
+    max: number;
+    weights: RiskWeightRange[];
+  };
+  paidOrderIntervals: {
+    min: number;
+    max: number;
+    buckets: {
+      days0To3: { weight: number };
+      days3To7: { weight: number };
+      daysOver7: { weight: number };
+    };
+  };
+  relatedAccountCount: {
+    min: number;
+    max: number;
+    weight: number;
+    enabledMinValue: number;
+  };
+  ipSwitchFrequency: {
+    min: number;
+    max: number;
+    weight: number;
+    enabledPaidCount: number;
+  };
+};
+
+type RiskOrderRow = {
+  id: number;
+  order_id: string;
+  package_number: string;
+  order_state: string | null;
+  order_created_time: Date | string | null;
+  client_ip: string | null;
+  province: string | null;
+  city: string | null;
+  detail_address: string | null;
+};
+
+const DEFAULT_RISK_SCORE_CONFIG: RiskScoreConfig = {
+  paidOrderCount: {
+    min: 1,
+    max: 20,
+    weights: [
+      { min: 1, max: 5, weight: 0.05 },
+      { min: 5, max: 10, weight: 0.1 },
+      { min: 10, weight: 0.25 }
+    ]
+  },
+  unfinishedRatio: {
+    min: 0,
+    max: 1,
+    weights: [
+      { max: 0.25, weight: 0.05, includeMax: true },
+      { min: 0.25, weight: 0.1, includeMin: false }
+    ]
+  },
+  paidOrderIntervals: {
+    min: 0,
+    max: 20,
+    buckets: {
+      days0To3: { weight: 0.25 },
+      days3To7: { weight: 0.08 },
+      daysOver7: { weight: 0.02 }
+    }
+  },
+  relatedAccountCount: {
+    min: 2,
+    max: 4,
+    weight: 0.08,
+    enabledMinValue: 2
+  },
+  ipSwitchFrequency: {
+    min: 1,
+    max: 2,
+    weight: 0.02,
+    enabledPaidCount: 5
+  }
+};
 
 @Injectable()
 export class BlacklistService {
@@ -103,11 +199,10 @@ export class BlacklistService {
       const transactionId = safeString(first.seller_transaction_id);
       const orderId = safeString(first.order_id);
       const remarkParts = [
-        `⚠️【不参与评分】争议用户：该邮箱关联 PayPal 争议订单`,
+        `⚠️【争议用户】该邮箱关联 PayPal 争议订单`,
         disputeId ? `争议ID ${disputeId}` : "",
         transactionId ? `交易号 ${transactionId}` : "",
-        orderId ? `关联订单 ${orderId}` : "",
-        `不参与评分。`
+        orderId ? `关联订单 ${orderId}` : ""
       ].filter(Boolean);
 
       return {
@@ -120,6 +215,90 @@ export class BlacklistService {
     }
 
     return { excluded: false, reason: null, remark: "", email };
+  }
+
+  async scoreByInput(input: Record<string, unknown>) {
+    return this.scoreByEmail(input.email);
+  }
+
+  async scoreByEmail(value: unknown) {
+    const email = normalizeEmail(value);
+    const startedAt = Date.now();
+
+    const nonRegularEmail = this.checkNonRegularEmail(email);
+    if (nonRegularEmail.excluded) {
+      this.logger.log(
+        `用户风险评分跳过：email=${email || "-"} reason=non_regular_email details=${JSON.stringify(nonRegularEmail.details || {})}`
+      );
+      return {
+        email,
+        scored: false,
+        excluded: true,
+        excludeReason: "non_regular_email" as RiskScoreExcludeReason,
+        totalScore: 0,
+        details: nonRegularEmail.details || {},
+        remark: nonRegularEmail.remark
+      };
+    }
+
+    const blacklistHits = await this.findByEmail(email);
+    if (blacklistHits.length > 0) {
+      this.logger.log(
+        `用户风险评分跳过：email=${email} reason=blacklist hitCount=${blacklistHits.length}`
+      );
+      return {
+        email,
+        scored: false,
+        excluded: true,
+        excludeReason: "blacklist" as RiskScoreExcludeReason,
+        totalScore: 0,
+        hits: blacklistHits
+      };
+    }
+
+    const disputeHits = await this.findDisputesByEmail(email);
+    if (disputeHits.length > 0) {
+      this.logger.log(
+        `用户风险评分跳过：email=${email} reason=dispute_user hitCount=${disputeHits.length}`
+      );
+      return {
+        email,
+        scored: false,
+        excluded: true,
+        excludeReason: "dispute_user" as RiskScoreExcludeReason,
+        totalScore: 0,
+        hits: disputeHits
+      };
+    }
+
+    const config = this.riskScoreConfig();
+    const orders = await this.findRiskScoreOrdersByEmail(email);
+    if (orders.length === 0) {
+      this.logger.log(`用户风险评分跳过：email=${email} reason=no_order`);
+      return {
+        email,
+        scored: false,
+        excluded: true,
+        excludeReason: "no_order" as RiskScoreExcludeReason,
+        totalScore: 0,
+        details: { validOrderCount: 0 }
+      };
+    }
+
+    const relatedEmailCount = await this.countRelatedEmailsByAddress(email);
+    const score = this.calculateRiskScore(config, orders, relatedEmailCount);
+
+    this.logger.log(
+      `用户风险评分完成：email=${email} totalScore=${score.totalScore} durationMs=${Date.now() - startedAt} details=${JSON.stringify(score.details)}`
+    );
+    return {
+      email,
+      scored: true,
+      excluded: false,
+      excludeReason: null,
+      totalScore: score.totalScore,
+      details: score.details
+    };
   }
 
   async markOrderAsBlacklisted(order: Record<string, unknown>) {
@@ -254,7 +433,7 @@ export class BlacklistService {
       return {
         excluded: true,
         reason: "non_regular_email",
-        remark: "⚠️【不参与评分】非常规邮箱：订单未提供有效邮箱，不参与评分。",
+        remark: "⚠️【邮箱异常】非常规邮箱：订单未提供有效邮箱。",
         email,
         details: { rule: "empty_email" }
       };
@@ -273,7 +452,7 @@ export class BlacklistService {
       return {
         excluded: true,
         reason: "non_regular_email",
-        remark: `⚠️【不参与评分】非常规邮箱：邮箱 ${email} 格式异常，不参与评分。`,
+        remark: `⚠️【邮箱异常】非常规邮箱：邮箱 ${email} 格式异常。`,
         email,
         details: { rule: "invalid_format" }
       };
@@ -300,7 +479,7 @@ export class BlacklistService {
       return {
         excluded: true,
         reason: "non_regular_email",
-        remark: `⚠️【不参与评分】非常规邮箱：邮箱 ${email} 命中临时/异常邮箱域名 ${matchedDomain}，不参与评分。`,
+        remark: `⚠️【邮箱异常】非常规邮箱：邮箱 ${email} 命中临时/异常邮箱域名 ${matchedDomain}。`,
         email,
         details: { rule: "domain", matchedDomain }
       };
@@ -315,7 +494,7 @@ export class BlacklistService {
       return {
         excluded: true,
         reason: "non_regular_email",
-        remark: `⚠️【不参与评分】非常规邮箱：邮箱 ${email} 命中异常邮箱名称 ${matchedLocalPart}，不参与评分。`,
+        remark: `⚠️【邮箱异常】非常规邮箱：邮箱 ${email} 命中异常邮箱名称 ${matchedLocalPart}。`,
         email,
         details: { rule: "local_part", matchedLocalPart }
       };
@@ -335,7 +514,7 @@ export class BlacklistService {
           o.transaction_id
         FROM order_address oa
         INNER JOIN orders o ON o.order_id = oa.order_id
-        WHERE oa.email = ?
+        WHERE LOWER(TRIM(oa.email)) = ?
           AND o.transaction_id IS NOT NULL
           AND o.transaction_id <> ''
         LIMIT 50
@@ -389,6 +568,305 @@ export class BlacklistService {
       this.logger.warn(`争议用户检查跳过：email=${email} durationMs=${Date.now() - startedAt} error=${this.formatError(error)}`);
       return [];
     }
+  }
+
+  private async findRiskScoreOrdersByEmail(email: string): Promise<RiskOrderRow[]> {
+    if (!email) return [];
+    const rows = await this.db.$queryRawUnsafe(
+      `
+      SELECT
+        o.id,
+        o.order_id,
+        o.package_number,
+        o.order_state,
+        o.order_created_time,
+        o.client_ip,
+        oa.province,
+        oa.city,
+        oa.detail_address
+      FROM order_address oa
+      INNER JOIN orders o ON BINARY o.order_id = BINARY oa.order_id
+      WHERE LOWER(TRIM(oa.email)) = ?
+        AND o.order_created_time IS NOT NULL
+      ORDER BY o.order_id ASC, o.order_created_time DESC, o.id DESC
+    `,
+      email
+    );
+    return this.dedupeRiskOrderRowsByOrderId(rows as RiskOrderRow[]);
+  }
+
+  private dedupeRiskOrderRowsByOrderId(rows: RiskOrderRow[]): RiskOrderRow[] {
+    const byOrderId = new Map<string, RiskOrderRow>();
+    for (const row of rows) {
+      const orderId = safeString(row.order_id);
+      if (!orderId || byOrderId.has(orderId)) continue;
+      byOrderId.set(orderId, row);
+    }
+    return Array.from(byOrderId.values()).sort((left, right) => {
+      const leftTime = this.toTimestamp(left.order_created_time) || 0;
+      const rightTime = this.toTimestamp(right.order_created_time) || 0;
+      if (leftTime !== rightTime) return leftTime - rightTime;
+      return this.toNumber(left.id) - this.toNumber(right.id);
+    });
+  }
+
+  private async countRelatedEmailsByAddress(email: string): Promise<number> {
+    if (!email) return 0;
+    const rows = (await this.db.$queryRawUnsafe(
+      `
+      SELECT COUNT(DISTINCT LOWER(TRIM(oa2.email))) AS related_email_count
+      FROM order_address oa2
+      INNER JOIN orders o2 ON BINARY o2.order_id = BINARY oa2.order_id
+      INNER JOIN (
+        SELECT DISTINCT
+          LOWER(TRIM(COALESCE(oa.province, ''))) AS province_key,
+          LOWER(TRIM(COALESCE(oa.city, ''))) AS city_key,
+          LOWER(TRIM(COALESCE(oa.detail_address, ''))) AS detail_address_key
+        FROM order_address oa
+        INNER JOIN orders o ON BINARY o.order_id = BINARY oa.order_id
+        WHERE LOWER(TRIM(oa.email)) = ?
+          AND o.order_created_time IS NOT NULL
+          AND TRIM(COALESCE(oa.detail_address, '')) <> ''
+      ) addr
+        ON LOWER(TRIM(COALESCE(oa2.province, ''))) = addr.province_key
+       AND LOWER(TRIM(COALESCE(oa2.city, ''))) = addr.city_key
+       AND LOWER(TRIM(COALESCE(oa2.detail_address, ''))) = addr.detail_address_key
+      WHERE oa2.email IS NOT NULL
+        AND TRIM(oa2.email) <> ''
+        AND o2.order_created_time IS NOT NULL
+    `,
+      email
+    )) as Array<Record<string, unknown>>;
+    return this.toNumber(rows[0]?.related_email_count);
+  }
+
+  private calculateRiskScore(
+    config: RiskScoreConfig,
+    orders: RiskOrderRow[],
+    relatedEmailCount: number
+  ): { totalScore: number; details: Record<string, unknown> } {
+    const totalOrders = orders.length;
+    const paidOrders = orders.filter((row) => this.isPaidOrderState(row.order_state));
+    const paidCount = paidOrders.length;
+    const orderedCount = orders.filter((row) => this.orderStateText(row.order_state) === "ordered").length;
+
+    const paidWeight = this.matchRiskWeight(paidCount, config.paidOrderCount.weights);
+    const paidNormalized = this.normalizePositive(
+      paidCount,
+      config.paidOrderCount.min,
+      config.paidOrderCount.max
+    );
+    const paidScore = paidNormalized * paidWeight * 100;
+
+    const unfinishedRatio = totalOrders > 0 ? orderedCount / totalOrders : 0;
+    const unfinishedWeight = totalOrders > 0 ? this.matchRiskWeight(unfinishedRatio, config.unfinishedRatio.weights) : 0;
+    const unfinishedNormalized = totalOrders > 0
+      ? this.normalizePositive(unfinishedRatio, config.unfinishedRatio.min, config.unfinishedRatio.max)
+      : 0;
+    const unfinishedScore = unfinishedNormalized * unfinishedWeight * 100;
+
+    const intervalCounts = this.countPaidOrderIntervals(paidOrders);
+    const intervalEnabled = paidCount >= 2;
+    const intervalMin = config.paidOrderIntervals.min;
+    const intervalMax = config.paidOrderIntervals.max;
+    const days0To3Score = intervalEnabled
+      ? this.normalizePositive(intervalCounts.days0To3, intervalMin, intervalMax) *
+        config.paidOrderIntervals.buckets.days0To3.weight *
+        100
+      : 0;
+    const days3To7Score = intervalEnabled
+      ? this.normalizePositive(intervalCounts.days3To7, intervalMin, intervalMax) *
+        config.paidOrderIntervals.buckets.days3To7.weight *
+        100
+      : 0;
+    const daysOver7Score = intervalEnabled
+      ? this.normalizePositive(intervalCounts.daysOver7, intervalMin, intervalMax) *
+        config.paidOrderIntervals.buckets.daysOver7.weight *
+        100
+      : 0;
+    const intervalScore = days0To3Score + days3To7Score + daysOver7Score;
+
+    const relatedEnabled = relatedEmailCount >= config.relatedAccountCount.enabledMinValue;
+    const relatedNormalized = relatedEnabled
+      ? this.normalizePositive(relatedEmailCount, config.relatedAccountCount.min, config.relatedAccountCount.max)
+      : 0;
+    const relatedScore = relatedNormalized * config.relatedAccountCount.weight * 100;
+
+    const distinctIpCount = new Set(
+      paidOrders.map((row) => safeString(row.client_ip)).filter(Boolean)
+    ).size;
+    const ipFrequency = distinctIpCount > 0 ? paidCount / distinctIpCount : 0;
+    const ipEnabled =
+      paidCount >= config.ipSwitchFrequency.enabledPaidCount &&
+      distinctIpCount > 0 &&
+      ipFrequency >= config.ipSwitchFrequency.min &&
+      ipFrequency <= config.ipSwitchFrequency.max;
+    const ipNormalized = ipEnabled
+      ? this.normalizeReverse(ipFrequency, config.ipSwitchFrequency.min, config.ipSwitchFrequency.max)
+      : 0;
+    const ipScore = ipNormalized * config.ipSwitchFrequency.weight * 100;
+
+    const totalScore = paidScore + unfinishedScore + intervalScore + relatedScore + ipScore;
+    const details = {
+      totalOrders,
+      paidCount,
+      orderedCount,
+      paidOrderCount: {
+        value: paidCount,
+        min: config.paidOrderCount.min,
+        max: config.paidOrderCount.max,
+        weight: paidWeight,
+        normalized: this.roundScore(paidNormalized),
+        score: this.roundScore(paidScore)
+      },
+      unfinishedRatio: {
+        value: this.roundScore(unfinishedRatio),
+        orderedCount,
+        totalOrders,
+        min: config.unfinishedRatio.min,
+        max: config.unfinishedRatio.max,
+        weight: unfinishedWeight,
+        normalized: this.roundScore(unfinishedNormalized),
+        score: this.roundScore(unfinishedScore)
+      },
+      paidOrderIntervals: {
+        enabled: intervalEnabled,
+        min: intervalMin,
+        max: intervalMax,
+        days0To3: {
+          value: intervalCounts.days0To3,
+          weight: config.paidOrderIntervals.buckets.days0To3.weight,
+          normalized: this.roundScore(intervalEnabled ? this.normalizePositive(intervalCounts.days0To3, intervalMin, intervalMax) : 0),
+          score: this.roundScore(days0To3Score)
+        },
+        days3To7: {
+          value: intervalCounts.days3To7,
+          weight: config.paidOrderIntervals.buckets.days3To7.weight,
+          normalized: this.roundScore(intervalEnabled ? this.normalizePositive(intervalCounts.days3To7, intervalMin, intervalMax) : 0),
+          score: this.roundScore(days3To7Score)
+        },
+        daysOver7: {
+          value: intervalCounts.daysOver7,
+          weight: config.paidOrderIntervals.buckets.daysOver7.weight,
+          normalized: this.roundScore(intervalEnabled ? this.normalizePositive(intervalCounts.daysOver7, intervalMin, intervalMax) : 0),
+          score: this.roundScore(daysOver7Score)
+        },
+        score: this.roundScore(intervalScore)
+      },
+      relatedAccountCount: {
+        enabled: relatedEnabled,
+        value: relatedEmailCount,
+        min: config.relatedAccountCount.min,
+        max: config.relatedAccountCount.max,
+        weight: config.relatedAccountCount.weight,
+        normalized: this.roundScore(relatedNormalized),
+        score: this.roundScore(relatedScore)
+      },
+      ipSwitchFrequency: {
+        enabled: ipEnabled,
+        value: this.roundScore(ipFrequency),
+        paidCount,
+        distinctIpCount,
+        min: config.ipSwitchFrequency.min,
+        max: config.ipSwitchFrequency.max,
+        weight: config.ipSwitchFrequency.weight,
+        normalized: this.roundScore(ipNormalized),
+        score: this.roundScore(ipScore)
+      }
+    };
+
+    return { totalScore: this.roundScore(totalScore), details };
+  }
+
+  private countPaidOrderIntervals(rows: RiskOrderRow[]): {
+    days0To3: number;
+    days3To7: number;
+    daysOver7: number;
+  } {
+    const timestamps = rows
+      .map((row) => this.toTimestamp(row.order_created_time))
+      .filter((value): value is number => value !== null)
+      .sort((left, right) => left - right);
+    const counts = { days0To3: 0, days3To7: 0, daysOver7: 0 };
+    for (let index = 1; index < timestamps.length; index += 1) {
+      const days = (timestamps[index] - timestamps[index - 1]) / 86400000;
+      if (days >= 0 && days <= 3) counts.days0To3 += 1;
+      else if (days > 3 && days <= 7) counts.days3To7 += 1;
+      else if (days > 7) counts.daysOver7 += 1;
+    }
+    return counts;
+  }
+
+  private riskScoreConfig(): RiskScoreConfig {
+    const raw = safeString(process.env.RISK_SCORE_CONFIG_JSON);
+    if (!raw) return DEFAULT_RISK_SCORE_CONFIG;
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      return this.mergeRiskScoreConfig(DEFAULT_RISK_SCORE_CONFIG, parsed) as RiskScoreConfig;
+    } catch (error) {
+      this.logger.warn(`风险评分配置解析失败，使用默认配置：error=${this.formatError(error)}`);
+      return DEFAULT_RISK_SCORE_CONFIG;
+    }
+  }
+
+  private mergeRiskScoreConfig(base: unknown, override: unknown): unknown {
+    if (Array.isArray(base)) return Array.isArray(override) ? override : base;
+    if (!base || typeof base !== "object") return override === undefined ? base : override;
+    if (!override || typeof override !== "object" || Array.isArray(override)) return base;
+
+    const merged: Record<string, unknown> = { ...(base as Record<string, unknown>) };
+    for (const [key, value] of Object.entries(override as Record<string, unknown>)) {
+      merged[key] = this.mergeRiskScoreConfig(merged[key], value);
+    }
+    return merged;
+  }
+
+  private matchRiskWeight(value: number, ranges: RiskWeightRange[]): number {
+    for (const range of ranges) {
+      const minOk =
+        range.min === undefined ||
+        (range.includeMin === false ? value > range.min : value >= range.min);
+      const maxOk =
+        range.max === undefined ||
+        (range.includeMax === true ? value <= range.max : value < range.max);
+      if (minOk && maxOk) return Number(range.weight || 0);
+    }
+    return 0;
+  }
+
+  private normalizePositive(value: number, min: number, max: number): number {
+    if (max === min) return 0;
+    return (value - min) / (max - min);
+  }
+
+  private normalizeReverse(value: number, min: number, max: number): number {
+    if (max === min) return 0;
+    return (max - value) / (max - min);
+  }
+
+  private isPaidOrderState(value: unknown): boolean {
+    return this.orderStateText(value) !== "ordered";
+  }
+
+  private orderStateText(value: unknown): string {
+    return safeString(value).trim().toLowerCase();
+  }
+
+  private toTimestamp(value: unknown): number | null {
+    if (!value) return null;
+    const timestamp = value instanceof Date ? value.getTime() : new Date(String(value)).getTime();
+    return Number.isFinite(timestamp) ? timestamp : null;
+  }
+
+  private toNumber(value: unknown): number {
+    if (typeof value === "bigint") return Number(value);
+    if (typeof value === "number") return value;
+    const parsed = Number(value || 0);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  private roundScore(value: number): number {
+    return Math.round(value * 1000000) / 1000000;
   }
 
   private configuredNonRegularEmailDomains(): string[] {

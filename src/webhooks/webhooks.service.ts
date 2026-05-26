@@ -77,11 +77,30 @@ export class WebhooksService {
 
       const scoreExclusion = await this.blacklistService.checkScoreExclusionByOrder(order);
       if (!scoreExclusion.excluded) {
+        const riskScore = await this.blacklistService.scoreByEmail(scoreExclusion.email);
+        const scoreThreshold = this.riskScoreNoteThreshold();
+        const shouldWriteRiskNote = riskScore.scored && riskScore.totalScore >= scoreThreshold;
+        const noteResult = shouldWriteRiskNote
+          ? await this.writeOrderNote(
+              orderId,
+              orderIdText,
+              this.buildRiskScoreNote(riskScore, scoreThreshold),
+              storeDomain
+            )
+          : { noteUpdated: false, noteConfirmed: false };
         this.logger.log(
-          `订单处理结果：topic=orders/update orderId=${orderIdText} blacklisted=false scoreExcluded=false noteUpdated=false`
+          `订单处理结果：topic=orders/update orderId=${orderIdText} blacklisted=false scoreExcluded=false riskScore=${String(riskScore.totalScore)} riskScoreNote=${String(shouldWriteRiskNote)} noteUpdated=${String(noteResult.noteUpdated)} noteConfirmed=${String(noteResult.noteConfirmed)}`
         );
         this.markRiskFingerprintProcessed(scopedOrderId, fingerprint);
-        return { blocked: false, scoreExcluded: false, orderId, noteUpdated: false };
+        return {
+          blocked: false,
+          scoreExcluded: false,
+          orderId,
+          riskScore,
+          riskScoreNote: shouldWriteRiskNote,
+          noteUpdated: noteResult.noteUpdated,
+          noteConfirmed: noteResult.noteConfirmed
+        };
       }
 
       this.logger.log(
@@ -157,6 +176,42 @@ export class WebhooksService {
     return { noteUpdated, noteConfirmed };
   }
 
+  private riskScoreNoteThreshold(): number {
+    const parsed = Number(process.env.RISK_SCORE_NOTE_THRESHOLD || 10);
+    return Number.isFinite(parsed) ? parsed : 10;
+  }
+
+  private buildRiskScoreNote(
+    riskScore: { totalScore?: unknown; details?: unknown },
+    threshold: number
+  ): string {
+    const details = this.asObject(riskScore.details);
+    const unfinishedRatio = this.asObject(details.unfinishedRatio);
+    const intervals = this.asObject(details.paidOrderIntervals);
+    const days0To3 = this.asObject(intervals.days0To3);
+    const days3To7 = this.asObject(intervals.days3To7);
+    const daysOver7 = this.asObject(intervals.daysOver7);
+    const relatedAccountCount = this.asObject(details.relatedAccountCount);
+    const ipSwitchFrequency = this.asObject(details.ipSwitchFrequency);
+
+    const totalScore = this.formatNumber(riskScore.totalScore);
+    const totalOrders = this.formatNumber(details.totalOrders);
+    const paidCount = this.formatNumber(details.paidCount);
+    const orderedCount = this.formatNumber(details.orderedCount);
+    const unfinishedRatioText = this.formatPercent(unfinishedRatio.value);
+    const ipFrequency = this.formatNumber(ipSwitchFrequency.value);
+    const distinctIpCount = this.formatNumber(ipSwitchFrequency.distinctIpCount);
+
+    return [
+      `⚠️【风险评分提醒】该用户风险评分 ${totalScore}，已达到备注阈值 ${this.formatNumber(threshold)}，请谨慎处理。`,
+      `订单数：有效订单 ${totalOrders} 单，已付款订单 ${paidCount} 单，未完成/未付款订单 ${orderedCount} 单。`,
+      `未完成订单占比：${unfinishedRatioText}。`,
+      `时间间隔订单数：[0,3]天 ${this.formatNumber(days0To3.value)} 个，(3,7]天 ${this.formatNumber(days3To7.value)} 个，>7天 ${this.formatNumber(daysOver7.value)} 个。`,
+      `关联账号数：${this.formatNumber(relatedAccountCount.value)}。`,
+      `IP切换频率：${ipFrequency}（已付款订单数 ${paidCount} / 不同IP数 ${distinctIpCount}）。`
+    ].join("\n");
+  }
+
   private buildRiskFingerprint(order: Record<string, unknown>): string {
     const risk = extractRiskIdentity(order);
     const normalized = JSON.stringify(risk);
@@ -204,6 +259,23 @@ export class WebhooksService {
       }
     }
     return {};
+  }
+
+  private toNumber(value: unknown): number {
+    if (typeof value === "bigint") return Number(value);
+    if (typeof value === "number") return value;
+    const parsed = Number(value || 0);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  private formatNumber(value: unknown): string {
+    const numberValue = this.toNumber(value);
+    if (Number.isInteger(numberValue)) return String(numberValue);
+    return String(Math.round(numberValue * 10000) / 10000);
+  }
+
+  private formatPercent(value: unknown): string {
+    return `${this.formatNumber(this.toNumber(value) * 100)}%`;
   }
 
   private findFirstDeepString(root: unknown, targetKeys: Set<string>): string {

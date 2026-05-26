@@ -28,4 +28,19 @@ export class BlacklistController {
   async check(@Body() body: Record<string, unknown>) {
     return this.blacklistService.checkByInput(body || {});
   }
+
+  @Post("score")
+  @ApiOperation({ summary: "Score user risk by email when not excluded by blacklist/disputes/email rules" })
+  @ApiBody({
+    schema: {
+      type: "object",
+      properties: {
+        email: { type: "string", example: "buyer@example.com" }
+      },
+      required: ["email"]
+    }
+  })
+  async score(@Body() body: Record<string, unknown>) {
+    return this.blacklistService.scoreByInput(body || {});
+  }
 }
