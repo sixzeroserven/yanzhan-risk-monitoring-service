@@ -307,7 +307,12 @@ def save_single_order(order_item: Dict[str, Any], fallback_addr: Optional[Dict[s
         conn.close()
 
 
-def save_order_with_subs(order_item: Dict[str, Any], fallback_addr: Optional[Dict[str, Any]] = None, parent_black_state: Optional[int] = None):
+def save_order_with_subs(
+    order_item: Dict[str, Any],
+    fallback_addr: Optional[Dict[str, Any]] = None,
+    parent_black_state: Optional[int] = None,
+    stats: Optional[Dict[str, int]] = None,
+):
     """
     递归保存一个订单及其所有子订单。
     如果当前订单有自身地址，则将该地址作为子订单的备选地址；
@@ -315,6 +320,9 @@ def save_order_with_subs(order_item: Dict[str, Any], fallback_addr: Optional[Dic
     黑名单继承规则：如果父订单（上层）是黑名单（parent_black_state=1），则当前订单强制为黑名单；
     否则使用当前订单自身的 blackState。
     """
+    if should_skip_test_order(order_item, stats):
+        return
+
     # 确定当前订单的黑名单状态（优先继承父订单的黑名单）
     if parent_black_state == 1:
         current_black_state = 1
@@ -335,16 +343,135 @@ def save_order_with_subs(order_item: Dict[str, Any], fallback_addr: Optional[Dic
     if sub_orders and isinstance(sub_orders, list):
         logger.debug(f"订单 {order_item.get('orderId')} 包含 {len(sub_orders)} 个子订单，开始处理")
         for sub_order in sub_orders:
-            save_order_with_subs(sub_order, fallback_addr=addr_to_pass, parent_black_state=current_black_state)
+            save_order_with_subs(
+                sub_order,
+                fallback_addr=addr_to_pass,
+                parent_black_state=current_black_state,
+                stats=stats,
+            )
 
 
 def save_orders_batch(orders: List[Dict[str, Any]]):
     """批量保存订单（含子订单）"""
     total_processed = 0
+    stats = {
+        "skipped_test_order_total": 0,
+        "skipped_test_order_amount_zero": 0,
+        "skipped_test_order_ordered": 0,
+    }
     for order in orders:
-        save_order_with_subs(order, fallback_addr=None, parent_black_state=None)
+        save_order_with_subs(order, fallback_addr=None, parent_black_state=None, stats=stats)
         total_processed += 1
     logger.info(f"批量保存完成：处理了 {total_processed} 个顶层订单（每个顶层订单可能附带多个子订单）")
+    logger.info(
+        "测试用户订单跳过统计：total=%s amount_zero=%s ordered_state=%s",
+        stats["skipped_test_order_total"],
+        stats["skipped_test_order_amount_zero"],
+        stats["skipped_test_order_ordered"],
+    )
+
+
+def should_skip_test_order(order_item: Dict[str, Any], stats: Optional[Dict[str, int]] = None) -> bool:
+    """用户名称包含 test，且订单金额为 0 或状态为 ordered 时跳过入库。"""
+    buyer_name = str(order_item.get("buyerName") or "").strip()
+    contact_name = str(order_item.get("contactName") or "").strip()
+    name_text = f"{buyer_name} {contact_name}".lower()
+    if "test" not in name_text:
+        return False
+
+    amount = extract_order_amount(order_item)
+    amount_zero = amount is not None and amount == 0
+    ordered_state = (extract_order_state(order_item) or "").strip().lower() == "ordered"
+    if not amount_zero and not ordered_state:
+        return False
+
+    if stats is not None:
+        stats["skipped_test_order_total"] = stats.get("skipped_test_order_total", 0) + 1
+        if amount_zero:
+            stats["skipped_test_order_amount_zero"] = stats.get("skipped_test_order_amount_zero", 0) + 1
+        if ordered_state:
+            stats["skipped_test_order_ordered"] = stats.get("skipped_test_order_ordered", 0) + 1
+
+    logger.info(
+        "跳过测试用户订单：orderId=%s packageNumber=%s buyerName=%s contactName=%s amount=%s orderState=%s",
+        order_item.get("orderId") or "-",
+        order_item.get("packageNumber") or "-",
+        buyer_name or "-",
+        contact_name or "-",
+        amount if amount is not None else "-",
+        extract_order_state(order_item) or "-",
+    )
+    return True
+
+
+def extract_order_amount(order_item: Dict[str, Any]) -> Optional[float]:
+    """从店小秘订单字段中尽量提取订单金额；缺失时返回 None。"""
+    amount_keys = (
+        "orderAmount",
+        "order_amount",
+        "totalAmount",
+        "total_amount",
+        "totalPrice",
+        "total_price",
+        "orderPrice",
+        "order_price",
+        "paymentAmount",
+        "payment_amount",
+        "payAmount",
+        "pay_amount",
+        "paidAmount",
+        "paid_amount",
+        "actualAmount",
+        "actual_amount",
+        "finalAmount",
+        "final_amount",
+        "amount",
+        "price",
+    )
+    for key in amount_keys:
+        if key in order_item:
+            parsed = parse_amount(order_item.get(key))
+            if parsed is not None:
+                return parsed
+    return find_amount_in_nested_order(order_item, set(amount_keys), max_depth=2)
+
+
+def find_amount_in_nested_order(value: Any, amount_keys: Set[str], max_depth: int, depth: int = 0) -> Optional[float]:
+    if depth > max_depth:
+        return None
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if str(key) in amount_keys:
+                parsed = parse_amount(item)
+                if parsed is not None:
+                    return parsed
+        for item in value.values():
+            parsed = find_amount_in_nested_order(item, amount_keys, max_depth, depth + 1)
+            if parsed is not None:
+                return parsed
+    elif isinstance(value, list):
+        for item in value:
+            parsed = find_amount_in_nested_order(item, amount_keys, max_depth, depth + 1)
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def parse_amount(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    cleaned = "".join(ch for ch in text.replace(",", "") if ch.isdigit() or ch in ".-")
+    if cleaned in ("", "-", ".", "-."):
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
 
 
 # ======================== 网络请求（支持动态payload） ========================

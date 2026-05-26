@@ -6,6 +6,7 @@ import * as path from "path";
 @Injectable()
 export class SchedulerService {
   private readonly logger = new Logger(SchedulerService.name);
+  private readonly runningJobs = new Set<string>();
 
   @Cron("00 18 * * *", { timeZone: "Asia/Shanghai" })
   runDailyCrawl(): void {
@@ -27,11 +28,23 @@ export class SchedulerService {
     this.runPythonJob("sync_shopline_order_fields.py");
   }
 
-  private runPythonJob(scriptFile: string): void {
-    const scriptPath = path.resolve(process.cwd(), "jobs", scriptFile);
-    this.logger.log(`开始执行脚本：${scriptPath}`);
+  @Cron(process.env.PAYPAL_DISPUTE_SYNC_CRON || "50 21 * * *", { timeZone: "Asia/Shanghai" })
+  runDailyPaypalDisputesSync(): void {
+    this.runPythonJob("sync_paypal_disputes.py", ["--lookback-days", "7", "--fetch-detail"]);
+  }
 
-    const child = spawn("python3", [scriptPath], {
+  private runPythonJob(scriptFile: string, args: string[] = []): void {
+    const jobKey = `${scriptFile} ${args.join(" ")}`.trim();
+    if (this.runningJobs.has(jobKey)) {
+      this.logger.warn(`脚本仍在执行中，跳过本次调度：${jobKey}`);
+      return;
+    }
+
+    const scriptPath = path.resolve(process.cwd(), "jobs", scriptFile);
+    this.runningJobs.add(jobKey);
+    this.logger.log(`开始执行脚本：${scriptPath}${args.length > 0 ? ` ${args.join(" ")}` : ""}`);
+
+    const child = spawn("python3", [scriptPath, ...args], {
       cwd: process.cwd(),
       stdio: ["ignore", "pipe", "pipe"]
     });
@@ -52,10 +65,12 @@ export class SchedulerService {
     });
 
     child.on("error", (error) => {
+      this.runningJobs.delete(jobKey);
       this.logger.error(`启动 ${scriptFile} 失败：${error.message}`);
     });
 
     child.on("close", (code) => {
+      this.runningJobs.delete(jobKey);
       if (code === 0) {
         this.logger.log(`${scriptFile} 执行完成`);
         return;

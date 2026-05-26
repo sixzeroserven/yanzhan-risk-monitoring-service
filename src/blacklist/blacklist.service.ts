@@ -914,33 +914,31 @@ export class BlacklistService {
   }
   private async findByDetailAddress(detailAddress: string): Promise<BlacklistHit[]> {
     if (!detailAddress) return [];
-    const addressLike = `%${detailAddress}%`;
     const rows = await this.db.$queryRawUnsafe(
       `
       SELECT o.id, o.order_id, o.package_number, 'detail_address' AS hit_type, oa.detail_address AS hit_value
        FROM order_address oa
        INNER JOIN orders o ON BINARY o.order_id = BINARY oa.order_id
        WHERE o.black_state = 1
-         AND LOWER(TRIM(COALESCE(oa.detail_address, ''))) LIKE ?
+         AND LOWER(TRIM(COALESCE(oa.detail_address, ''))) = ?
        LIMIT 20
     `,
-      addressLike
+      detailAddress
     );
     return rows as BlacklistHit[];
   }
   private async findByAddress2(address2: string): Promise<BlacklistHit[]> {
     if (!address2) return [];
-    const address2Like = `%${address2}%`;
     const rows = await this.db.$queryRawUnsafe(
       `
       SELECT o.id, o.order_id, o.package_number, 'address2' AS hit_type, oa.address2 AS hit_value
       FROM order_address oa
       INNER JOIN orders o ON BINARY o.order_id = BINARY oa.order_id
       WHERE o.black_state = 1
-        AND LOWER(TRIM(COALESCE(oa.address2, ''))) LIKE ?
+        AND LOWER(TRIM(COALESCE(oa.address2, ''))) = ?
       LIMIT 20
     `,
-      address2Like
+      address2
     );
     return rows as BlacklistHit[];
   }
