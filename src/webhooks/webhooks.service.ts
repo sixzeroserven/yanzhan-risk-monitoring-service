@@ -4,7 +4,10 @@ import * as crypto from "crypto";
 import { BlacklistService } from "../blacklist/blacklist.service";
 import { normalizeEmail } from "../common/utils/normalize.util";
 import { ShoplazzaService } from "../shoplazza/shoplazza.service";
+import { ShoplineService } from "../shopline/shopline.service";
 import { extractRiskIdentity } from "./webhook-order.util";
+
+type WebhookPlatform = "shoplazza" | "shopline";
 
 @Injectable()
 export class WebhooksService {
@@ -16,10 +19,11 @@ export class WebhooksService {
   private lastRiskFingerprintCleanupAt = 0;
   constructor(
     private readonly blacklistService: BlacklistService,
-    private readonly shoplazzaService: ShoplazzaService
+    private readonly shoplazzaService: ShoplazzaService,
+    private readonly shoplineService: ShoplineService
   ) {}
 
-  async processOrderUpdate(order: Record<string, unknown>, storeDomain?: string) {
+  async processOrderUpdate(order: Record<string, unknown>, storeDomain?: string, platform: WebhookPlatform = "shoplazza") {
     const orderId = (
       order.order_id ||
       order.id ||
@@ -33,7 +37,7 @@ export class WebhooksService {
     this.logger.log(
       `Webhook 订单邮箱：orderId=${orderIdText} email=${receivedEmail || "-"} store=${storeDomain || "-"}`
     );
-    const scopedOrderId = `${String(storeDomain || "default").toLowerCase()}::${orderIdText}`;
+    const scopedOrderId = `${platform}::${String(storeDomain || "default").toLowerCase()}::${orderIdText}`;
     const fingerprint = this.buildRiskFingerprint(order);
     const now = Date.now();
     this.cleanupExpiredRiskFingerprints(now);
@@ -58,7 +62,7 @@ export class WebhooksService {
         );
 
         const note = `⚠️【黑名单拦截】命中规则：${hitTypes.join("、")}。该用户被识别为黑名单，请谨慎处理！`;
-        const noteResult = await this.writeOrderNote(orderId, orderIdText, note, storeDomain);
+        const noteResult = await this.writeOrderNote(orderId, orderIdText, note, storeDomain, platform);
         this.logger.log(
           `订单处理结果：topic=orders/update orderId=${orderIdText} blacklisted=true scoreExcluded=true noteUpdated=${String(noteResult.noteUpdated)} noteConfirmed=${String(noteResult.noteConfirmed)}`
         );
@@ -85,7 +89,8 @@ export class WebhooksService {
               orderId,
               orderIdText,
               this.buildRiskScoreNote(riskScore, scoreThreshold),
-              storeDomain
+              storeDomain,
+              platform
             )
           : { noteUpdated: false, noteConfirmed: false };
         this.logger.log(
@@ -106,7 +111,7 @@ export class WebhooksService {
       this.logger.log(
         `命中不参与评分规则：orderId=${orderIdText} reason=${scoreExclusion.reason || "-"} email=${scoreExclusion.email || "-"}`
       );
-      const noteResult = await this.writeOrderNote(orderId, orderIdText, scoreExclusion.remark, storeDomain);
+      const noteResult = await this.writeOrderNote(orderId, orderIdText, scoreExclusion.remark, storeDomain, platform);
       this.logger.log(
         `订单处理结果：topic=orders/update orderId=${orderIdText} blacklisted=false scoreExcluded=true reason=${scoreExclusion.reason || "-"} noteUpdated=${String(noteResult.noteUpdated)} noteConfirmed=${String(noteResult.noteConfirmed)}`
       );
@@ -148,23 +153,34 @@ export class WebhooksService {
     orderId: string | number,
     orderIdText: string,
     note: string,
-    storeDomain?: string
+    storeDomain?: string,
+    platform: WebhookPlatform = "shoplazza"
   ): Promise<{ noteUpdated: boolean; noteConfirmed: boolean }> {
     let noteUpdated = true;
     let noteConfirmed = false;
     try {
-      const currentReadback = await this.shoplazzaService.getOrderReadback(orderId, storeDomain);
-      const existingNote = this.pickFirstString(
-        currentReadback.order?.note,
-        currentReadback.order?.order_note,
-        currentReadback.order?.customer_note,
-        currentReadback.order?.memo
-      );
+      const noteService = this.noteService(platform);
+      let existingNote = "";
+      try {
+        const currentReadback = await noteService.getOrderReadback(orderId, storeDomain);
+        existingNote = this.pickFirstString(
+          currentReadback.order?.note,
+          currentReadback.order?.order_note,
+          currentReadback.order?.customer_note,
+          currentReadback.order?.memo,
+          currentReadback.order?.remark
+        );
+      } catch (error) {
+        if (platform !== "shopline") throw error;
+        this.logger.warn(
+          `Shopline 订单备注读取失败，将直接尝试写入：orderId=${orderIdText}，错误=${this.formatAxiosError(error)}`
+        );
+      }
       if (this.hasNoteText(existingNote, note)) {
         noteConfirmed = true;
         this.logger.log(`备注已存在，跳过重复写入：orderId=${orderIdText}`);
       } else {
-        await this.shoplazzaService.appendOrderNote(orderId, note, storeDomain, existingNote);
+        await noteService.appendOrderNote(orderId, note, storeDomain, existingNote);
         noteConfirmed = true;
       }
     } catch (error) {
@@ -174,6 +190,21 @@ export class WebhooksService {
       );
     }
     return { noteUpdated, noteConfirmed };
+  }
+
+  private noteService(platform: WebhookPlatform): {
+    getOrderReadback: (
+      orderId: string | number,
+      storeDomain?: string
+    ) => Promise<{ order: Record<string, unknown>; usedPath: string; raw: Record<string, unknown> }>;
+    appendOrderNote: (
+      orderId: string | number,
+      note: string,
+      storeDomain?: string,
+      existingNoteFromCaller?: string
+    ) => Promise<void>;
+  } {
+    return platform === "shopline" ? this.shoplineService : this.shoplazzaService;
   }
 
   private riskScoreNoteThreshold(): number {
