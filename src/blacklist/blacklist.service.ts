@@ -196,10 +196,12 @@ export class BlacklistService {
     if (disputeHits.length > 0) {
       const first = disputeHits[0];
       const disputeId = safeString(first.dispute_id);
+      const buyerEmail = safeString(first.buyer_email);
       const transactionId = safeString(first.seller_transaction_id);
       const orderId = safeString(first.order_id);
       const remarkParts = [
         `⚠️【争议用户】该邮箱关联 PayPal 争议订单`,
+        buyerEmail ? `争议邮箱 ${buyerEmail}` : "",
         disputeId ? `争议ID ${disputeId}` : "",
         transactionId ? `交易号 ${transactionId}` : "",
         orderId ? `关联订单 ${orderId}` : ""
@@ -507,6 +509,7 @@ export class BlacklistService {
     if (!email) return [];
     const startedAt = Date.now();
     try {
+      const buyerEmailRows = await this.findDisputesByBuyerEmail(email);
       const orderRows = (await this.db.$queryRawUnsafe(
         `
         SELECT DISTINCT
@@ -522,52 +525,94 @@ export class BlacklistService {
         email
       )) as Array<Record<string, unknown>>;
 
-      if (orderRows.length === 0) {
-        this.logger.log(`争议用户查询完成：email=${email} transactions=0 hits=0 durationMs=${Date.now() - startedAt}`);
-        return [];
-      }
-
       const transactionIds = Array.from(
         new Set(orderRows.map((row) => safeString(row.transaction_id)).filter(Boolean))
       );
-      if (transactionIds.length === 0) {
-        this.logger.log(`争议用户查询完成：email=${email} transactions=0 hits=0 durationMs=${Date.now() - startedAt}`);
-        return [];
+      let transactionRows: Array<Record<string, unknown>> = [];
+      if (transactionIds.length > 0) {
+        const placeholders = transactionIds.map(() => "?").join(",");
+        const disputeRows = (await this.db.$queryRawUnsafe(
+          `
+          SELECT
+            pd.dispute_id,
+            pd.dispute_state,
+            pd.dispute_stage,
+            pd.dispute_reason,
+            pd.buyer_email,
+            pd.seller_transaction_id,
+            pd.seller_transaction_id AS transaction_id,
+            pd.create_time,
+            pd.update_time,
+            'seller_transaction_id' AS hit_source
+          FROM paypal_disputes pd
+          WHERE pd.seller_transaction_id IN (${placeholders})
+          ORDER BY COALESCE(pd.update_time, pd.create_time) DESC
+          LIMIT 20
+        `,
+          ...transactionIds
+        )) as Array<Record<string, unknown>>;
+
+        const orderIdByTransaction = new Map(
+          orderRows.map((row) => [safeString(row.transaction_id), safeString(row.order_id)])
+        );
+        transactionRows = disputeRows.map((row) => ({
+          ...row,
+          order_id: orderIdByTransaction.get(safeString(row.seller_transaction_id)) || ""
+        }));
       }
 
-      const placeholders = transactionIds.map(() => "?").join(",");
-      const disputeRows = (await this.db.$queryRawUnsafe(
-        `
-        SELECT
-          pd.dispute_id,
-          pd.dispute_state,
-          pd.dispute_stage,
-          pd.dispute_reason,
-          pd.seller_transaction_id,
-          pd.seller_transaction_id AS transaction_id
-        FROM paypal_disputes pd
-        WHERE pd.seller_transaction_id IN (${placeholders})
-        ORDER BY COALESCE(pd.update_time, pd.create_time) DESC
-        LIMIT 20
-      `,
-        ...transactionIds
-      )) as Array<Record<string, unknown>>;
-
-      const orderIdByTransaction = new Map(
-        orderRows.map((row) => [safeString(row.transaction_id), safeString(row.order_id)])
-      );
-      const rows = disputeRows.map((row) => ({
-        ...row,
-        order_id: orderIdByTransaction.get(safeString(row.seller_transaction_id)) || ""
-      }));
+      const rows = this.dedupeDisputeRows([...buyerEmailRows, ...transactionRows]).slice(0, 20);
       this.logger.log(
-        `争议用户查询完成：email=${email} transactions=${transactionIds.length} hits=${rows.length} durationMs=${Date.now() - startedAt}`
+        `争议用户查询完成：email=${email} buyerEmailHits=${buyerEmailRows.length} transactions=${transactionIds.length} hits=${rows.length} durationMs=${Date.now() - startedAt}`
       );
       return rows;
     } catch (error) {
       this.logger.warn(`争议用户检查跳过：email=${email} durationMs=${Date.now() - startedAt} error=${this.formatError(error)}`);
       return [];
     }
+  }
+
+  private async findDisputesByBuyerEmail(email: string): Promise<Array<Record<string, unknown>>> {
+    if (!email) return [];
+    try {
+      const rows = (await this.db.$queryRawUnsafe(
+        `
+        SELECT
+          pd.dispute_id,
+          pd.dispute_state,
+          pd.dispute_stage,
+          pd.dispute_reason,
+          pd.buyer_email,
+          pd.seller_transaction_id,
+          pd.seller_transaction_id AS transaction_id,
+          pd.create_time,
+          pd.update_time,
+          'buyer_email' AS hit_source,
+          '' AS order_id
+        FROM paypal_disputes pd
+        WHERE LOWER(TRIM(pd.buyer_email)) = ?
+        ORDER BY COALESCE(pd.update_time, pd.create_time) DESC
+        LIMIT 20
+      `,
+        email
+      )) as Array<Record<string, unknown>>;
+      return rows;
+    } catch (error) {
+      this.logger.warn(`争议邮箱直接查询跳过：email=${email} error=${this.formatError(error)}`);
+      return [];
+    }
+  }
+
+  private dedupeDisputeRows(rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+    const seen = new Set<string>();
+    const deduped: Array<Record<string, unknown>> = [];
+    for (const row of rows) {
+      const key = safeString(row.dispute_id) || `${safeString(row.seller_transaction_id)}:${safeString(row.buyer_email)}`;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(row);
+    }
+    return deduped;
   }
 
   private async findRiskScoreOrdersByEmail(email: string): Promise<RiskOrderRow[]> {

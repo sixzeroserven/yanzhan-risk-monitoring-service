@@ -397,6 +397,57 @@ def first_disputed_transaction(dispute: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+def pick_nested_str(root: Dict[str, Any], *paths: Tuple[str, ...]) -> str:
+    for path in paths:
+        current: Any = root
+        for key in path:
+            if not isinstance(current, dict):
+                current = None
+                break
+            current = current.get(key)
+        text = str(current).strip() if current is not None else ""
+        if text:
+            return text
+    return ""
+
+
+def extract_buyer_email(dispute: Dict[str, Any], tx: Dict[str, Any]) -> Optional[str]:
+    first_disputed = {}
+    rows = dispute.get("disputed_transactions")
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        first_disputed = rows[0]
+
+    email = pick_nested_str(
+        dispute,
+        ("buyer", "email"),
+        ("buyer", "email_address"),
+        ("buyer_info", "email"),
+        ("buyer_info", "email_address"),
+        ("payer", "email"),
+        ("payer", "email_address"),
+    ) or pick_nested_str(
+        first_disputed,
+        ("buyer", "email"),
+        ("buyer", "email_address"),
+        ("buyer_info", "email"),
+        ("buyer_info", "email_address"),
+        ("transaction_info", "buyer", "email"),
+        ("transaction_info", "buyer", "email_address"),
+        ("transaction_info", "buyer_info", "email"),
+        ("transaction_info", "buyer_info", "email_address"),
+    ) or pick_nested_str(
+        tx,
+        ("buyer", "email"),
+        ("buyer", "email_address"),
+        ("buyer_info", "email"),
+        ("buyer_info", "email_address"),
+        ("payer", "email"),
+        ("payer", "email_address"),
+    )
+    normalized = email.strip().lower()
+    return normalized[:256] if normalized else None
+
+
 def to_decimal_or_none(value: Any) -> Optional[Decimal]:
     if value is None:
         return None
@@ -455,6 +506,7 @@ def build_dispute_row(dispute: Dict[str, Any]) -> Dict[str, Any]:
         "seller_transaction_id": pick_str(tx, "seller_transaction_id"),
         "invoice_id": pick_str(tx, "invoice_id", "invoice_number", "custom"),
         "buyer_payer_id": pick_str(buyer_info, "payer_id"),
+        "buyer_email": extract_buyer_email(dispute, tx),
         "seller_merchant_id": pick_str(seller_info, "merchant_id"),
     }
 
@@ -497,6 +549,7 @@ def ensure_table(cursor) -> None:
             seller_transaction_id VARCHAR(64) DEFAULT NULL,
             invoice_id VARCHAR(127) DEFAULT NULL,
             buyer_payer_id VARCHAR(64) DEFAULT NULL,
+            buyer_email VARCHAR(256) DEFAULT NULL,
             seller_merchant_id VARCHAR(64) DEFAULT NULL,
             raw_payload LONGTEXT,
             detail_payload LONGTEXT COMMENT 'GET /v1/customer/disputes/{id} 完整 JSON（仅 --fetch-detail 时写入）',
@@ -508,6 +561,7 @@ def ensure_table(cursor) -> None:
             KEY idx_state (dispute_state),
             KEY idx_update_time (update_time),
             KEY idx_buyer_tx (buyer_transaction_id),
+            KEY idx_buyer_email (buyer_email),
             KEY idx_paypal_disputes_seller_tx (seller_transaction_id),
             KEY idx_invoice_id (invoice_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -535,6 +589,27 @@ def ensure_table(cursor) -> None:
             "ALTER TABLE paypal_disputes ADD COLUMN buyer_evidence_notes TEXT NULL "
             "COMMENT 'INTERNAL 详情 evidences[0].notes' AFTER detail_payload"
         )
+    cursor.execute(
+        """
+        SELECT COUNT(1) FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 'paypal_disputes' AND column_name = 'buyer_email'
+        """
+    )
+    if cursor.fetchone()[0] == 0:
+        cursor.execute(
+            "ALTER TABLE paypal_disputes ADD COLUMN buyer_email VARCHAR(256) DEFAULT NULL "
+            "COMMENT 'PayPal 争议买家邮箱' AFTER buyer_payer_id"
+        )
+    cursor.execute(
+        """
+        SELECT COUNT(1) FROM information_schema.statistics
+        WHERE table_schema = DATABASE()
+          AND table_name = 'paypal_disputes'
+          AND index_name = 'idx_buyer_email'
+        """
+    )
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("CREATE INDEX idx_buyer_email ON paypal_disputes(buyer_email)")
 
 
 def upsert_dispute(cursor, row: Dict[str, Any]) -> int:
@@ -554,6 +629,7 @@ def upsert_dispute(cursor, row: Dict[str, Any]) -> int:
       seller_transaction_id,
       invoice_id,
       buyer_payer_id,
+      buyer_email,
       seller_merchant_id,
       raw_payload,
       detail_payload,
@@ -573,6 +649,7 @@ def upsert_dispute(cursor, row: Dict[str, Any]) -> int:
       %(seller_transaction_id)s,
       %(invoice_id)s,
       %(buyer_payer_id)s,
+      %(buyer_email)s,
       %(seller_merchant_id)s,
       %(raw_payload)s,
       %(detail_payload)s,
@@ -592,6 +669,7 @@ def upsert_dispute(cursor, row: Dict[str, Any]) -> int:
       seller_transaction_id = VALUES(seller_transaction_id),
       invoice_id = VALUES(invoice_id),
       buyer_payer_id = VALUES(buyer_payer_id),
+      buyer_email = COALESCE(VALUES(buyer_email), buyer_email),
       seller_merchant_id = VALUES(seller_merchant_id),
       raw_payload = VALUES(raw_payload),
       detail_payload = COALESCE(VALUES(detail_payload), detail_payload),
