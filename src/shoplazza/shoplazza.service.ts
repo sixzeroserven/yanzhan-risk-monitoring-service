@@ -133,12 +133,7 @@ export class ShoplazzaService implements OnModuleInit {
           return;
         }
         const readback = await this.getOrderReadback(orderId, storeDomain);
-        const savedNote = this.pickFirstString(
-          readback.order.note,
-          readback.order.order_note,
-          readback.order.customer_note,
-          readback.order.memo
-        );
+        const savedNote = this.pickOrderNoteWithCustomerNote(readback.order);
         if (this.hasNoteText(savedNote, note)) {
           this.logger.log(
             `订单备注写入成功：orderId=${String(orderId)} writePath=${attempt.path} payloadType=${payloadType} confirmed=true`
@@ -170,12 +165,7 @@ export class ShoplazzaService implements OnModuleInit {
 
   private async readExistingOrderNote(orderId: string | number, storeDomain?: string): Promise<string> {
     const currentReadback = await this.getOrderReadback(orderId, storeDomain);
-    return this.pickFirstString(
-      currentReadback.order.note,
-      currentReadback.order.order_note,
-      currentReadback.order.customer_note,
-      currentReadback.order.memo
-    );
+    return this.pickOrderNoteWithCustomerNote(currentReadback.order);
   }
 
   async getOrderReadback(orderId: string | number, storeDomain?: string): Promise<{
@@ -373,6 +363,21 @@ export class ShoplazzaService implements OnModuleInit {
       if (text) return text;
     }
     return "";
+  }
+
+  private pickOrderNoteWithCustomerNote(order: Record<string, unknown>): string {
+    const note = this.pickFirstString(order.note, order.order_note, order.memo, order.remark);
+    const customerNote = this.pickFirstString(order.customer_note);
+    const labeledCustomerNote = this.formatCustomerNote(customerNote);
+    if (!note) return labeledCustomerNote;
+    if (!customerNote || note.includes(customerNote)) return note;
+    return `${note}\n${labeledCustomerNote}`;
+  }
+
+  private formatCustomerNote(customerNote: string): string {
+    if (!customerNote) return "";
+    if (customerNote.startsWith("【买家留言】")) return customerNote;
+    return `【买家留言】${customerNote}`;
   }
 
   private getWebhookCollectionPath(): string {

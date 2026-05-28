@@ -62,7 +62,7 @@ export class WebhooksService {
         );
 
         const note = `⚠️【黑名单拦截】命中规则：${hitTypes.join("、")}。该用户被识别为黑名单，请谨慎处理！`;
-        const noteResult = await this.writeOrderNote(orderId, orderIdText, note, storeDomain, platform);
+        const noteResult = await this.writeOrderNote(orderId, orderIdText, note, storeDomain, platform, order);
         this.logger.log(
           `订单处理结果：topic=orders/update orderId=${orderIdText} blacklisted=true scoreExcluded=true noteUpdated=${String(noteResult.noteUpdated)} noteConfirmed=${String(noteResult.noteConfirmed)}`
         );
@@ -90,7 +90,8 @@ export class WebhooksService {
               orderIdText,
               this.buildRiskScoreNote(riskScore, scoreThreshold),
               storeDomain,
-              platform
+              platform,
+              order
             )
           : { noteUpdated: false, noteConfirmed: false };
         this.logger.log(
@@ -111,7 +112,14 @@ export class WebhooksService {
       this.logger.log(
         `命中不参与评分规则：orderId=${orderIdText} reason=${scoreExclusion.reason || "-"} email=${scoreExclusion.email || "-"}`
       );
-      const noteResult = await this.writeOrderNote(orderId, orderIdText, scoreExclusion.remark, storeDomain, platform);
+      const noteResult = await this.writeOrderNote(
+        orderId,
+        orderIdText,
+        scoreExclusion.remark,
+        storeDomain,
+        platform,
+        order
+      );
       this.logger.log(
         `订单处理结果：topic=orders/update orderId=${orderIdText} blacklisted=false scoreExcluded=true reason=${scoreExclusion.reason || "-"} noteUpdated=${String(noteResult.noteUpdated)} noteConfirmed=${String(noteResult.noteConfirmed)}`
       );
@@ -154,7 +162,8 @@ export class WebhooksService {
     orderIdText: string,
     note: string,
     storeDomain?: string,
-    platform: WebhookPlatform = "shoplazza"
+    platform: WebhookPlatform = "shoplazza",
+    sourceOrder?: Record<string, unknown>
   ): Promise<{ noteUpdated: boolean; noteConfirmed: boolean }> {
     let noteUpdated = true;
     let noteConfirmed = false;
@@ -163,19 +172,17 @@ export class WebhooksService {
       let existingNote = "";
       try {
         const currentReadback = await noteService.getOrderReadback(orderId, storeDomain);
-        existingNote = this.pickFirstString(
-          currentReadback.order?.note,
-          currentReadback.order?.order_note,
-          currentReadback.order?.customer_note,
-          currentReadback.order?.memo,
-          currentReadback.order?.remark
-        );
+        existingNote = this.pickOrderNoteWithCustomerNote(currentReadback.order);
       } catch (error) {
         if (platform !== "shopline") throw error;
         this.logger.warn(
           `Shopline 订单备注读取失败，将直接尝试写入：orderId=${orderIdText}，错误=${this.formatAxiosError(error)}`
         );
       }
+      existingNote = this.appendTextIfMissing(
+        existingNote,
+        this.formatCustomerNote(this.pickFirstString(sourceOrder?.customer_note, sourceOrder?.customerNote))
+      );
       if (this.hasNoteText(existingNote, note)) {
         noteConfirmed = true;
         this.logger.log(`备注已存在，跳过重复写入：orderId=${orderIdText}`);
@@ -256,6 +263,27 @@ export class WebhooksService {
       if (text) return text;
     }
     return "";
+  }
+
+  private pickOrderNoteWithCustomerNote(order: Record<string, unknown> = {}): string {
+    const note = this.pickFirstString(order.note, order.order_note, order.memo, order.remark);
+    const customerNote = this.pickFirstString(order.customer_note);
+    const labeledCustomerNote = this.formatCustomerNote(customerNote);
+    if (!note) return labeledCustomerNote;
+    if (!customerNote || note.includes(customerNote)) return note;
+    return `${note}\n${labeledCustomerNote}`;
+  }
+
+  private formatCustomerNote(customerNote: string): string {
+    if (!customerNote) return "";
+    if (customerNote.startsWith("【买家留言】")) return customerNote;
+    return `【买家留言】${customerNote}`;
+  }
+
+  private appendTextIfMissing(text: string, extra: string): string {
+    if (!text) return extra;
+    if (!extra || text.includes(extra)) return text;
+    return `${text}\n${extra}`;
   }
 
   private extractEmailForLog(order: Record<string, unknown>): string {
