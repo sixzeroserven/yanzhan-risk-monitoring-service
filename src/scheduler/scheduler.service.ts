@@ -33,6 +33,11 @@ export class SchedulerService {
     this.runPythonJob("sync_paypal_disputes.py", ["--lookback-days", "7", "--fetch-detail"]);
   }
 
+  @Cron(process.env.PAYPAL_REPORTING_SYNC_CRON || "20 23 * * *", { timeZone: "Asia/Shanghai" })
+  runDailyPaypalReportingSync(): void {
+    this.runPythonJob("sync_paypal_reporting_transactions.py", ["--lookback-days", "7"]);
+  }
+
   private runPythonJob(scriptFile: string, args: string[] = []): void {
     const jobKey = `${scriptFile} ${args.join(" ")}`.trim();
     if (this.runningJobs.has(jobKey)) {

@@ -29,6 +29,8 @@
 - PAYPAL_DISPUTE_DETAIL_FAILED_LOG（详情失败 dispute_id 记录文件，默认 logs/paypal_dispute_detail_failed_ids.log）
 - PAYPAL_DISPUTE_DETAIL_READ_TIMEOUT（详情接口读取超时秒数，默认 30）
 - PAYPAL_DISPUTE_STOP_DETAIL_ON_RATE_LIMIT（详情接口遇到 429 后本轮停止继续调详情，默认 0）
+- AI_ATTRIBUTION_ENABLED=true 时，对 buyer_evidence_notes 调用 OpenAI-compatible 接口做多标签归因
+- AI_ATTRIBUTION_API_KEY、AI_ATTRIBUTION_BASE_URL、AI_ATTRIBUTION_MODEL、AI_ATTRIBUTION_WIRE_API、AI_ATTRIBUTION_TIMEOUT_MS
 
 说明：PayPal「列出争议」接口要求 start_time 必须落在最近 180 天内（否则会 INVALID_START_TIME_RANGE），无法通过该接口一次性拉 180 天之前的争议。
 
@@ -42,6 +44,7 @@
 超半年无法用列表接口时，可按 dispute_id 仅调详情并 upsert：
 - python3 jobs/sync_paypal_disputes.py --dispute-ids PP-R-XXX-123,PP-R-YYY-456
 - python3 jobs/sync_paypal_disputes.py --backfill-builtin-dispute-ids（使用脚本内建 ID 数组）
+- python3 jobs/sync_paypal_disputes.py --classify-existing（对历史 buyer_evidence_notes 回填 AI 归因）
 """
 
 from __future__ import annotations
@@ -85,6 +88,20 @@ PAGE_SIZE_DEFAULT = int(os.getenv("PAYPAL_DISPUTE_PAGE_SIZE", "50") or "50")
 # https://developer.paypal.com/docs/api/customer-disputes/v1/ — start_time 必须在最近 180 天内。
 PAYPAL_LIST_START_MAX_LOOKBACK_DAYS = 179
 DEFAULT_DISPUTE_STATE = (os.getenv("PAYPAL_DISPUTE_STATE") or "").strip()
+
+DISPUTE_ATTRIBUTION_LABELS: Dict[int, str] = {
+    1: "未收到商品",
+    2: "欺诈/骗局投诉（假货；冒充亚马逊；卖家信息不一致）",
+    3: "货不对版（收到商品跟宣传不一致；错发）",
+    4: "物流问题（无法查询物流信息；物流长时间未更新；发货太慢）",
+    5: "卖家沟通问题（无法联系卖家；邮件不回复；商家无联系方式；回复不及时）",
+    6: "价格争议（认为商品定价过高）",
+    7: "商品质量问题（商品损坏）",
+    8: "未授权付费",
+    9: "无理由全额退款",
+    10: "升级为索赔",
+    11: "其他",
+}
 
 # 列表接口时间窗外需按 ID 补拉详情的争议（维护在此元组即可）
 BUILTIN_DISPUTE_IDS_BACKFILL: Tuple[str, ...] = (
@@ -190,6 +207,222 @@ def dispute_detail_failed_log_path() -> str:
 def dispute_stop_detail_on_rate_limit() -> bool:
     raw = (os.getenv("PAYPAL_DISPUTE_STOP_DETAIL_ON_RATE_LIMIT") or "0").strip().lower()
     return raw in ("1", "true", "yes", "y", "on")
+
+
+def ai_attribution_enabled() -> bool:
+    raw = (os.getenv("AI_ATTRIBUTION_ENABLED") or "false").strip().lower()
+    return raw in ("1", "true", "yes", "y", "on")
+
+
+def ai_attribution_timeout_seconds() -> float:
+    raw = (os.getenv("AI_ATTRIBUTION_TIMEOUT_MS") or "30000").strip()
+    try:
+        timeout_ms = float(raw)
+    except ValueError:
+        timeout_ms = 30000.0
+    return max(5.0, min(timeout_ms / 1000.0, 120.0))
+
+
+def normalize_attribution_types(values: Any) -> Optional[str]:
+    if not isinstance(values, list):
+        return None
+    out: List[int] = []
+    seen: Set[int] = set()
+    for value in values:
+        try:
+            num = int(value)
+        except (TypeError, ValueError):
+            continue
+        if num < 1 or num > 11 or num in seen:
+            continue
+        seen.add(num)
+        out.append(num)
+    if not out:
+        out = [11]
+    concrete = [num for num in out if num != 11]
+    if concrete:
+        out = concrete
+    out = sorted(out)
+    return ",".join(str(num) for num in out)
+
+
+def extract_response_text(data: Any) -> str:
+    if not isinstance(data, dict):
+        return ""
+    direct = data.get("output_text")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    output = data.get("output")
+    if not isinstance(output, list):
+        return ""
+    parts: List[str] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            text = block.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+    return "\n".join(parts).strip()
+
+
+def extract_response_stream_text(response: requests.Response) -> str:
+    parts: List[str] = []
+    completed_payload: Optional[Dict[str, Any]] = None
+    for raw_line in response.iter_lines(decode_unicode=True):
+        line = (raw_line or "").strip()
+        if not line or not line.startswith("data:"):
+            continue
+        data_text = line[len("data:") :].strip()
+        if not data_text or data_text == "[DONE]":
+            continue
+        try:
+            event = json.loads(data_text)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_type = str(event.get("type") or "")
+        if event_type == "response.output_text.delta":
+            delta = event.get("delta")
+            if isinstance(delta, str):
+                parts.append(delta)
+        elif event_type == "response.completed":
+            payload = event.get("response")
+            if isinstance(payload, dict):
+                completed_payload = payload
+    text = "".join(parts).strip()
+    if text:
+        return text
+    return extract_response_text(completed_payload)
+
+
+class AiAttributionClient:
+    def __init__(self) -> None:
+        self.enabled = ai_attribution_enabled()
+        self.api_key = (os.getenv("AI_ATTRIBUTION_API_KEY") or "").strip()
+        self.base_url = (os.getenv("AI_ATTRIBUTION_BASE_URL") or "https://api.openai.com/v1").strip().rstrip("/")
+        self.model = (os.getenv("AI_ATTRIBUTION_MODEL") or "gpt-4.1-mini").strip()
+        self.wire_api = (os.getenv("AI_ATTRIBUTION_WIRE_API") or "chat_completions").strip().lower()
+        self.timeout = ai_attribution_timeout_seconds()
+        self.cache: Dict[str, Optional[str]] = {}
+        self.session = requests.Session()
+
+    def ready(self) -> bool:
+        return bool(self.enabled and self.api_key and self.base_url and self.model)
+
+    def classify(self, notes: Optional[str]) -> Optional[str]:
+        text = (notes or "").strip()
+        if not text:
+            return None
+        if text in self.cache:
+            return self.cache[text]
+        if not self.ready():
+            self.cache[text] = None
+            return None
+
+        prompt = (
+            "你是 PayPal 争议归因分类器。根据买家提交的 buyer_evidence_notes，"
+            "将争议归到一个或多个类型。只能输出 JSON，不要解释。\n\n"
+            "类型编号：\n"
+            "1 未收到商品\n"
+            "2 欺诈/骗局投诉（假货；冒充亚马逊；卖家信息不一致）\n"
+            "3 货不对版（收到商品跟宣传不一致；错发）\n"
+            "4 物流问题（无法查询物流信息；物流长时间未更新；发货太慢）\n"
+            "5 卖家沟通问题（无法联系卖家；邮件不回复；商家无联系方式；回复不及时）\n"
+            "6 价格争议（认为商品定价过高）\n"
+            "7 商品质量问题（商品损坏）\n"
+            "8 未授权付费\n"
+            "9 无理由全额退款\n"
+            "10 升级为索赔\n"
+            "11 其他\n\n"
+            "要求：\n"
+            "- 可以返回多个类型。\n"
+            "- 如果有具体类型，不要返回 11。\n"
+            "- 只有完全无法判断时才返回 11。\n"
+            "- 输出格式必须是：{\"types\":[数字数组]}\n\n"
+            f"buyer_evidence_notes:\n{text[:6000]}"
+        )
+        chat_payload = {
+            "model": self.model,
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "你是 PayPal 争议归因分类器。只能输出 JSON，不要解释。",
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+        }
+        responses_payload = {
+            "model": self.model,
+            "stream": True,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": prompt,
+                        }
+                    ],
+                }
+            ],
+            "text": {"format": {"type": "json_object"}},
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        use_responses = self.wire_api in ("responses", "response")
+        url = f"{self.base_url}/responses" if use_responses else f"{self.base_url}/chat/completions"
+        payload = responses_payload if use_responses else chat_payload
+
+        for attempt in range(1, 3):
+            try:
+                resp = self.session.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=self.timeout,
+                    stream=use_responses,
+                )
+                if resp.status_code >= 400:
+                    logger.warning(
+                        "AI 争议归因请求失败 status=%s attempt=%s body=%s",
+                        resp.status_code,
+                        attempt,
+                        resp.text[:600],
+                    )
+                    time.sleep(min(5.0, attempt * 1.5))
+                    continue
+                if use_responses:
+                    content = extract_response_stream_text(resp)
+                else:
+                    data = resp.json()
+                    choices = data.get("choices") if isinstance(data, dict) else None
+                    message = choices[0].get("message") if isinstance(choices, list) and choices else None
+                    content = message.get("content") if isinstance(message, dict) else ""
+                parsed = json.loads(content or "{}")
+                result = normalize_attribution_types(parsed.get("types") if isinstance(parsed, dict) else None)
+                if result:
+                    self.cache[text] = result
+                    return result
+            except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+                logger.warning("AI 争议归因异常 attempt=%s error=%s", attempt, exc)
+                time.sleep(min(5.0, attempt * 1.5))
+
+        self.cache[text] = None
+        return None
 
 
 def retry_after_delay_seconds(response: requests.Response) -> Optional[float]:
@@ -554,6 +787,7 @@ def ensure_table(cursor) -> None:
             raw_payload LONGTEXT,
             detail_payload LONGTEXT COMMENT 'GET /v1/customer/disputes/{id} 完整 JSON（仅 --fetch-detail 时写入）',
             buyer_evidence_notes TEXT COMMENT 'INTERNAL 且详情 evidences[0].notes（--fetch-detail）',
+            buyer_evidence_attribution_types VARCHAR(64) DEFAULT NULL COMMENT 'buyer_evidence_notes AI 多标签归因编号，逗号分隔',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (id),
@@ -588,6 +822,17 @@ def ensure_table(cursor) -> None:
         cursor.execute(
             "ALTER TABLE paypal_disputes ADD COLUMN buyer_evidence_notes TEXT NULL "
             "COMMENT 'INTERNAL 详情 evidences[0].notes' AFTER detail_payload"
+        )
+    cursor.execute(
+        """
+        SELECT COUNT(1) FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 'paypal_disputes' AND column_name = 'buyer_evidence_attribution_types'
+        """
+    )
+    if cursor.fetchone()[0] == 0:
+        cursor.execute(
+            "ALTER TABLE paypal_disputes ADD COLUMN buyer_evidence_attribution_types VARCHAR(64) DEFAULT NULL "
+            "COMMENT 'buyer_evidence_notes AI 多标签归因编号，逗号分隔' AFTER buyer_evidence_notes"
         )
     cursor.execute(
         """
@@ -633,7 +878,8 @@ def upsert_dispute(cursor, row: Dict[str, Any]) -> int:
       seller_merchant_id,
       raw_payload,
       detail_payload,
-      buyer_evidence_notes
+      buyer_evidence_notes,
+      buyer_evidence_attribution_types
     ) VALUES (
       %(dispute_id)s,
       %(dispute_state)s,
@@ -653,7 +899,8 @@ def upsert_dispute(cursor, row: Dict[str, Any]) -> int:
       %(seller_merchant_id)s,
       %(raw_payload)s,
       %(detail_payload)s,
-      %(buyer_evidence_notes)s
+      %(buyer_evidence_notes)s,
+      %(buyer_evidence_attribution_types)s
     )
     ON DUPLICATE KEY UPDATE
       dispute_state = VALUES(dispute_state),
@@ -677,6 +924,11 @@ def upsert_dispute(cursor, row: Dict[str, Any]) -> int:
         VALUES(detail_payload) IS NOT NULL,
         VALUES(buyer_evidence_notes),
         buyer_evidence_notes
+      ),
+      buyer_evidence_attribution_types = IF(
+        VALUES(buyer_evidence_attribution_types) IS NOT NULL AND VALUES(buyer_evidence_attribution_types) <> '',
+        VALUES(buyer_evidence_attribution_types),
+        buyer_evidence_attribution_types
       )
     """
     cursor.execute(sql, row)
@@ -880,7 +1132,38 @@ def parse_dispute_id_file(path: str) -> List[str]:
         raise SystemExit(1)
 
 
-def persist_dispute_rows(rows: List[Dict[str, Any]], dry_run: bool, stats: Dict[str, int]) -> None:
+def apply_ai_attribution_to_rows(rows: List[Dict[str, Any]], stats: Dict[str, Any]) -> None:
+    client = AiAttributionClient()
+    stats["ai_attribution_enabled"] = bool(client.enabled)
+    stats["ai_attribution_ready"] = bool(client.ready())
+    stats["ai_attribution_classified"] = 0
+    stats["ai_attribution_skipped"] = 0
+    stats["ai_attribution_failed"] = 0
+
+    if client.enabled and not client.ready():
+        logger.warning(
+            "AI 争议归因已启用但配置不完整，请检查 AI_ATTRIBUTION_API_KEY / AI_ATTRIBUTION_BASE_URL / AI_ATTRIBUTION_MODEL"
+        )
+
+    for row in rows:
+        notes = row.get("buyer_evidence_notes")
+        if not notes:
+            row["buyer_evidence_attribution_types"] = None
+            stats["ai_attribution_skipped"] += 1
+            continue
+        if not client.ready():
+            row["buyer_evidence_attribution_types"] = None
+            stats["ai_attribution_skipped"] += 1
+            continue
+        result = client.classify(str(notes))
+        row["buyer_evidence_attribution_types"] = result
+        if result:
+            stats["ai_attribution_classified"] += 1
+        else:
+            stats["ai_attribution_failed"] += 1
+
+
+def persist_dispute_rows(rows: List[Dict[str, Any]], dry_run: bool, stats: Dict[str, Any]) -> None:
     stats["db_insert_or_update"] = 0
     stats["db_skipped"] = 0
     if dry_run:
@@ -896,6 +1179,7 @@ def persist_dispute_rows(rows: List[Dict[str, Any]], dry_run: bool, stats: Dict[
         ensure_table(cursor)
         conn.commit()
 
+        apply_ai_attribution_to_rows(rows, stats)
         for row in rows:
             affected = upsert_dispute(cursor, row)
             if affected > 0:
@@ -907,6 +1191,83 @@ def persist_dispute_rows(rows: List[Dict[str, Any]], dry_run: bool, stats: Dict[
     finally:
         cursor.close()
         conn.close()
+
+
+def classify_existing_disputes(dry_run: bool, force: bool, limit: int) -> Dict[str, Any]:
+    stats: Dict[str, Any] = {
+        "selected": 0,
+        "classified": 0,
+        "failed": 0,
+        "skipped": 0,
+        "updated": 0,
+        "dry_run": bool(dry_run),
+        "force": bool(force),
+    }
+    if not MYSQL_CONFIG["database"]:
+        logger.error("请配置 DB_NAME")
+        raise SystemExit(1)
+
+    client = AiAttributionClient()
+    if not client.ready():
+        logger.error(
+            "AI 争议归因不可用，请配置 AI_ATTRIBUTION_ENABLED=true、AI_ATTRIBUTION_API_KEY、AI_ATTRIBUTION_BASE_URL、AI_ATTRIBUTION_MODEL"
+        )
+        raise SystemExit(1)
+
+    conn = pymysql.connect(**MYSQL_CONFIG)
+    cursor = conn.cursor()
+    try:
+        ensure_table(cursor)
+        conn.commit()
+
+        where = "buyer_evidence_notes IS NOT NULL AND TRIM(buyer_evidence_notes) <> ''"
+        if not force:
+            where += " AND (buyer_evidence_attribution_types IS NULL OR buyer_evidence_attribution_types = '')"
+        sql = f"""
+            SELECT id, dispute_id, buyer_evidence_notes
+            FROM paypal_disputes
+            WHERE {where}
+            ORDER BY COALESCE(update_time, create_time, updated_at, created_at) DESC
+        """
+        params: List[Any] = []
+        if limit > 0:
+            sql += " LIMIT %s"
+            params.append(int(limit))
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
+        stats["selected"] = len(rows)
+
+        for index, row in enumerate(rows, start=1):
+            row_id, dispute_id, buyer_evidence_notes = row
+            dispute_id = str(dispute_id or "")
+            result = client.classify(str(buyer_evidence_notes or ""))
+            if not result:
+                stats["failed"] += 1
+                logger.warning("AI 争议归因失败 dispute_id=%s progress=%s/%s", dispute_id, index, len(rows))
+                continue
+            stats["classified"] += 1
+            if dry_run:
+                logger.info("[dry-run] dispute_id=%s buyer_evidence_attribution_types=%s", dispute_id, result)
+                continue
+            cursor.execute(
+                """
+                UPDATE paypal_disputes
+                SET buyer_evidence_attribution_types = %s
+                WHERE id = %s
+                """,
+                (result, row_id),
+            )
+            stats["updated"] += cursor.rowcount
+            if index % 50 == 0:
+                conn.commit()
+                logger.info("AI 争议归因回填进度：%s/%s updated=%s failed=%s", index, len(rows), stats["updated"], stats["failed"])
+
+        if not dry_run:
+            conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+    return stats
 
 
 def sync_disputes_by_ids(dispute_ids: List[str], dry_run: bool, account: PayPalAccount) -> Dict[str, Any]:
@@ -1054,8 +1415,40 @@ def main() -> None:
         default="",
         help="只同步指定 PayPal 账号名；多个用逗号分隔。默认同步全部配置账号",
     )
+    parser.add_argument(
+        "--classify-existing",
+        action="store_true",
+        help="只回填已入库 buyer_evidence_notes 的 AI 归因，不拉 PayPal API",
+    )
+    parser.add_argument(
+        "--force-reclassify",
+        action="store_true",
+        help="配合 --classify-existing 使用：覆盖已有 buyer_evidence_attribution_types",
+    )
+    parser.add_argument(
+        "--classify-limit",
+        type=int,
+        default=0,
+        help="配合 --classify-existing 使用：最多处理 N 条，0 表示不限制",
+    )
     args = parser.parse_args()
-    accounts = select_paypal_accounts(args.paypal_account)
+
+    if args.classify_existing:
+        stats = classify_existing_disputes(
+            dry_run=args.dry_run,
+            force=args.force_reclassify,
+            limit=max(0, args.classify_limit),
+        )
+        logger.info(
+            "AI 争议归因回填完成：selected=%s classified=%s failed=%s updated=%s dry_run=%s force=%s",
+            stats.get("selected", 0),
+            stats.get("classified", 0),
+            stats.get("failed", 0),
+            stats.get("updated", 0),
+            stats.get("dry_run", False),
+            stats.get("force", False),
+        )
+        return
 
     id_sources = sum(
         1
@@ -1069,6 +1462,8 @@ def main() -> None:
     if id_sources > 1:
         logger.error("--dispute-ids / --dispute-ids-file / --backfill-builtin-dispute-ids 只能三选一")
         raise SystemExit(1)
+
+    accounts = select_paypal_accounts(args.paypal_account)
 
     if args.backfill_builtin_dispute_ids:
         ids = list(BUILTIN_DISPUTE_IDS_BACKFILL)
