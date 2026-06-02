@@ -11,7 +11,7 @@ import {
 export interface BlacklistHit {
   id: number;
   order_id: string;
-  package_number: string;
+  package_number: string | null;
   hit_type: string;
   hit_value: string;
 }
@@ -73,7 +73,7 @@ type RiskScoreConfig = {
 type RiskOrderRow = {
   id: number;
   order_id: string;
-  package_number: string;
+  package_number: string | null;
   order_state: string | null;
   order_created_time: Date | string | null;
   client_ip: string | null;

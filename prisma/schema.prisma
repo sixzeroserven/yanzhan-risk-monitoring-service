@@ -38,7 +38,7 @@ model Order {
   paymentMethod    String?   @map("payment_method") @db.VarChar(100)
   paymentChannel   String?   @map("payment_channel") @db.VarChar(100)
   variantId       String?   @map("variant_id") @db.VarChar(255)
-  packageNumber String    @map("package_number") @db.VarChar(100)
+  packageNumber String?   @map("package_number") @db.VarChar(100)
   buyerName     String?   @map("buyer_name") @db.VarChar(200)
   contactName   String?   @map("contact_name") @db.VarChar(200)
   buyerAccount  String?   @map("buyer_account") @db.VarChar(200)
