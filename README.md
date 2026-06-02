@@ -109,6 +109,7 @@ docker compose up -d --build
 
 - `jobs/crawl_orders.py`：抓取店小秘订单，需在 `.env` 中配置 **`DIANXIAOMI_COOKIE`**（浏览器登录店小秘后复制完整 Cookie）。  
 - `jobs/sync_platform_orders_base.py`：从 Shoplazza / Shopline 拉取订单基础信息并写入 `orders`、`order_address`；不更新 `black_state`、`package_number`、`transaction_id`、`device_fingerprint`，未付款订单会写为 `order_state=ordered`。示例：`python3 jobs/sync_platform_orders_base.py --platform all --since-days 3 --dry-run --max-pages-per-store 1 --debug-fetch`。  
+- `jobs/sync_mabang_black_state.py`：从马帮后台订单列表接口拉取 `platformOrderId` 与 `isBlackUser`，只更新 `orders.black_state`（`1=>1`，`2=>0`），需配置 **`MABANG_COOKIE`**。示例：`python3 jobs/sync_mabang_black_state.py --since-days 3 --dry-run --max-pages 1 --debug-fetch`。  
 - `jobs/sync_hipay_transaction_ids.py`：从 Hipay 同步交易号到库表 `transaction_id`，需配置 **`HIPAY_AUTHORIZATION`**（完整 `Bearer …` 字符串）。  
 - `jobs/sync_paypal_disputes.py`：从 PayPal Disputes API 同步争议数据到库表 `paypal_disputes`，单账号可配置 **`PAYPAL_CLIENT_ID`**、**`PAYPAL_CLIENT_SECRET`**（可选 `PAYPAL_BASE_URL`、`PAYPAL_PROXY_URL`）。多 PayPal 账号可配置 `PAYPAL_ACCOUNTS_JSON` 或 `PAYPAL_ACCOUNT_KEYS`，每个账号独立 `proxy_url`，OAuth/Disputes API 都走该账号自己的静态住宅代理。  
 - `jobs/sync_paypal_reporting_transactions.py`：从 PayPal Reporting Transaction Search（`/v1/reporting/transactions`）按 T 码拉取交易并写入 `paypal_reporting_transactions`；与 disputes 共用同一套 PayPal 多账号/代理配置。可选环境变量见 `.env.example` 中 `PAYPAL_REPORTING_*`（分页、T 码集合、回溯上限、HTTP 超时与重试）。建表见 `sql/init.sql` 或 `npx prisma db push`。  
