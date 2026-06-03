@@ -235,13 +235,12 @@ cp .env.docker.example .env
 
 ## 定时任务模块
 
-应用内置 Nest 定时任务，默认每日 **`01:00`** 执行：
+应用内置 Nest 定时任务，代码：`src/scheduler/scheduler.service.ts`。默认包括：
 
-- Cron：`0 1 * * *`  
-- 命令：`python3 jobs/crawl_orders.py`  
-- 代码：`src/scheduler/scheduler.service.ts`  
-
-脚本路径：`jobs/crawl_orders.py`（请确保 `.env` 中已配置 **`DIANXIAOMI_COOKIE`**）。  
+- `18:00`：`sync_platform_orders_base.py --platform all --since-days 7`，可用 `PLATFORM_ORDERS_BASE_SYNC_CRON`、`PLATFORM_ORDERS_BASE_SYNC_PLATFORM`、`PLATFORM_ORDERS_BASE_SYNC_DAYS` 覆盖。  
+- `18:30`：`sync_mabang_black_state.py --since-days 7`，可用 `MABANG_BLACK_STATE_SYNC_CRON`、`MABANG_BLACK_STATE_SYNC_DAYS` 覆盖。  
+- `19:30`：`sync_hipay_transaction_ids.py`。  
+- PayPal Disputes / Reporting 同步见 `PAYPAL_DISPUTE_SYNC_CRON`、`PAYPAL_REPORTING_SYNC_CRON`。  
 
 ##在docker中执行脚本docker compose exec app python3 + .....
 ## ssh azureuser@20.6.132.23

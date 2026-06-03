@@ -8,25 +8,43 @@ export class SchedulerService {
   private readonly logger = new Logger(SchedulerService.name);
   private readonly runningJobs = new Set<string>();
 
+  // @Cron("00 18 * * *", { timeZone: "Asia/Shanghai" })
+  // runDailyCrawl(): void {
+  //   this.runPythonJob("crawl_orders.py");
+  // }
+
   @Cron("00 18 * * *", { timeZone: "Asia/Shanghai" })
-  runDailyCrawl(): void {
-    this.runPythonJob("crawl_orders.py");
+  runDailyPlatformOrdersBaseSync(): void {
+    this.runPythonJob("sync_platform_orders_base.py", [
+      "--platform",
+      "all",
+      "--since-days",
+      "3"
+    ]);
   }
 
-  @Cron("30 19 * * *", { timeZone: "Asia/Shanghai" })
+  @Cron("00 19 * * *", { timeZone: "Asia/Shanghai" })
+  runDailyMabangBlackStateSync(): void {
+    this.runPythonJob("sync_mabang_black_state.py", [
+      "--since-days",
+      "3"
+    ]);
+  }
+
+  @Cron("00 20 * * *", { timeZone: "Asia/Shanghai" })
   runDailyHipaySync(): void {
     this.runPythonJob("sync_hipay_transaction_ids.py");
   }
 
-  @Cron("00 20 * * *", { timeZone: "Asia/Shanghai" })
-  runDailyShoplazzaOrderFieldsSync(): void {
-    this.runPythonJob("sync_shoplazza_order_fields.py");
-  }
+  // @Cron("00 20 * * *", { timeZone: "Asia/Shanghai" })
+  // runDailyShoplazzaOrderFieldsSync(): void {
+  //   this.runPythonJob("sync_shoplazza_order_fields.py");
+  // }
 
-  @Cron("30 20 * * *", { timeZone: "Asia/Shanghai" })
-  runDailyShoplineOrderFieldsSync(): void {
-    this.runPythonJob("sync_shopline_order_fields.py");
-  }
+  // @Cron("30 20 * * *", { timeZone: "Asia/Shanghai" })
+  // runDailyShoplineOrderFieldsSync(): void {
+  //   this.runPythonJob("sync_shopline_order_fields.py");
+  // }
 
   @Cron(process.env.PAYPAL_DISPUTE_SYNC_CRON || "50 21 * * *", { timeZone: "Asia/Shanghai" })
   runDailyPaypalDisputesSync(): void {
