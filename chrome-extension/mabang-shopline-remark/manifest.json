@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Mabang Shopline Remark",
+  "version": "0.1.0",
+  "description": "Display Shopline risk_note on Mabangerp order rows.",
+  "permissions": ["storage"],
+  "host_permissions": ["https://www.mabangerp.com/*", "<all_urls>"],
+  "content_scripts": [
+    {
+      "matches": ["https://www.mabangerp.com/*"],
+      "js": ["hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://www.mabangerp.com/*"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_start"
+    }
+  ],
+  "options_page": "options.html"
+}

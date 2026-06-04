@@ -3,7 +3,19 @@ import { AxiosInstance } from "axios";
 import axios from "axios";
 import * as crypto from "crypto";
 import * as https from "https";
-import { EnvConfig } from "../common/config/env.config";
+import { EnvConfig, ShoplazzaStoreConfig } from "../common/config/env.config";
+
+export type ShoplazzaOrderRemarkRequest = {
+  orderId: string;
+  storeDomain?: string;
+  storeName?: string;
+};
+
+export type ShoplazzaOrderRemarkLookup = {
+  orderId: string;
+  customer_note: string;
+  storeDomain: string;
+};
 
 @Injectable()
 export class ShoplazzaService implements OnModuleInit {
@@ -192,6 +204,66 @@ export class ShoplazzaService implements OnModuleInit {
     return { order: {}, usedPath: "", raw: {} };
   }
 
+  async lookupOrderRemarksForOrders(
+    orders: ShoplazzaOrderRemarkRequest[]
+  ): Promise<Record<string, ShoplazzaOrderRemarkLookup>> {
+    const uniqueOrders = this.uniqueOrderRemarkRequests(orders);
+    const result: Record<string, ShoplazzaOrderRemarkLookup> = {};
+    if (uniqueOrders.length === 0) return result;
+
+    const stores = this.env.shoplazzaStores;
+    const pending = new Map(uniqueOrders.map((item) => [item.orderId, item]));
+
+    for (const store of stores) {
+      const ordersForStore = Array.from(pending.values()).filter((item) =>
+        this.shouldQueryStoreForOrder(store, item, stores)
+      );
+      const batchLookups = await this.lookupOrderRemarksByIdsInStore(store, ordersForStore);
+      for (const lookup of batchLookups) {
+        if (!pending.has(lookup.orderId)) continue;
+        result[lookup.orderId] = lookup;
+        pending.delete(lookup.orderId);
+      }
+
+      const remainingForStore = ordersForStore.filter((item) => pending.has(item.orderId));
+      const lookups = await this.mapConcurrent(remainingForStore, 5, (item) =>
+        this.lookupOrderRemarkInStore(store, item, "查询")
+      );
+      for (const lookup of lookups) {
+        if (!lookup || !pending.has(lookup.orderId)) continue;
+        result[lookup.orderId] = lookup;
+        pending.delete(lookup.orderId);
+      }
+      if (pending.size === 0) break;
+    }
+
+    const hintedStillPending = Array.from(pending.values()).filter((item) => this.hasStoreHint(item));
+    if (hintedStillPending.length > 0) {
+      for (const store of stores) {
+        const ordersForStore = hintedStillPending.filter((row) => pending.has(row.orderId));
+        const batchLookups = await this.lookupOrderRemarksByIdsInStore(store, ordersForStore);
+        for (const lookup of batchLookups) {
+          if (!pending.has(lookup.orderId)) continue;
+          result[lookup.orderId] = lookup;
+          pending.delete(lookup.orderId);
+        }
+
+        const remainingForStore = ordersForStore.filter((item) => pending.has(item.orderId));
+        const lookups = await this.mapConcurrent(remainingForStore, 5, (item) =>
+          this.lookupOrderRemarkInStore(store, item, "兜底查询")
+        );
+        for (const lookup of lookups) {
+          if (!lookup || !pending.has(lookup.orderId)) continue;
+          result[lookup.orderId] = lookup;
+          pending.delete(lookup.orderId);
+        }
+        if (pending.size === 0) break;
+      }
+    }
+
+    return result;
+  }
+
   async subscribeOrderUpdateWebhook(callbackUrl?: string, storeDomain?: string) {
     return this.subscribeOrderWebhook("orders/update", callbackUrl, storeDomain);
   }
@@ -354,6 +426,222 @@ export class ShoplazzaService implements OnModuleInit {
       return row;
     }
     return {};
+  }
+
+  private async lookupOrderRemarksByIdsInStore(
+    store: ShoplazzaStoreConfig,
+    orders: ShoplazzaOrderRemarkRequest[]
+  ): Promise<ShoplazzaOrderRemarkLookup[]> {
+    const out: ShoplazzaOrderRemarkLookup[] = [];
+    for (const batch of this.chunk(orders, 50)) {
+      if (batch.length === 0) continue;
+      const ids = batch.map((item) => item.orderId);
+      try {
+        const rows = await this.fetchOrdersListByIds(store.storeDomain, ids);
+        const requested = new Set(ids);
+        for (const order of rows) {
+          const matchedId = this.matchRequestedOrderId(order, requested);
+          if (!matchedId) continue;
+          const riskNote = this.extractRiskRemark(order);
+          if (!riskNote) continue;
+          out.push({
+            orderId: matchedId,
+            customer_note: riskNote,
+            storeDomain: store.storeDomain
+          });
+        }
+      } catch (error) {
+        this.logger.debug(
+          `Shoplazza risk note ids 批量查询跳过：store=${store.storeDomain} count=${batch.length} ${this.formatAxiosError(error)}`
+        );
+      }
+    }
+    return out;
+  }
+
+  private async fetchOrdersListByIds(storeDomain: string, orderIds: string[]): Promise<Record<string, unknown>[]> {
+    const client = this.client(storeDomain);
+    const ids = orderIds.join(",");
+    let lastError: unknown;
+    for (const path of this.getOrderListPaths()) {
+      try {
+        const resp = await client.get(path, { params: { ids } });
+        const rows = this.pickOrderArray(resp.data);
+        if (rows.length > 0) return rows;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    if (lastError) throw lastError;
+    return [];
+  }
+
+  private getOrderListPaths(): string[] {
+    const version = encodeURIComponent(this.env.shoplazzaGlobal.apiVersion || "2020-07");
+    return [`/openapi/${version}/orders.json`, `/openapi/${version}/orders`];
+  }
+
+  private pickOrderArray(data: unknown): Record<string, unknown>[] {
+    if (Array.isArray(data)) {
+      return data.filter((item) => item && typeof item === "object" && !Array.isArray(item)) as Record<string, unknown>[];
+    }
+    if (!data || typeof data !== "object") return [];
+    const record = data as Record<string, unknown>;
+    const candidates = [record.orders, record.data, record.items, record.results];
+    for (const item of candidates) {
+      if (Array.isArray(item)) return this.pickOrderArray(item);
+      if (item && typeof item === "object") {
+        const nested = item as Record<string, unknown>;
+        const nestedRows = this.pickOrderArray(nested.orders || nested.items || nested.results || nested.list);
+        if (nestedRows.length > 0) return nestedRows;
+      }
+    }
+    return [];
+  }
+
+  private matchRequestedOrderId(order: Record<string, unknown>, requested: Set<string>): string {
+    for (const orderId of requested) {
+      if (this.isLikelyOrderMatch(order, orderId)) return orderId;
+    }
+    return "";
+  }
+
+  private isLikelyOrderMatch(order: Record<string, unknown>, orderId: string): boolean {
+    const expected = String(orderId || "").trim();
+    if (!expected || Object.keys(order).length === 0) return false;
+    const candidates = [
+      order.id,
+      order.order_id,
+      order.orderId,
+      order.admin_graphql_api_id,
+      order.name,
+      order.order_name,
+      order.orderName,
+      order.order_number,
+      order.orderNo,
+      order.order_no,
+      order.number
+    ];
+    return candidates.some((value) => String(value || "").trim() === expected);
+  }
+
+  private chunk<T>(items: T[], size: number): T[][] {
+    const out: T[][] = [];
+    for (let i = 0; i < items.length; i += size) {
+      out.push(items.slice(i, i + size));
+    }
+    return out;
+  }
+
+  private uniqueOrderRemarkRequests(orders: ShoplazzaOrderRemarkRequest[]): ShoplazzaOrderRemarkRequest[] {
+    const seen = new Set<string>();
+    const out: ShoplazzaOrderRemarkRequest[] = [];
+    for (const item of orders) {
+      const orderId = String(item?.orderId || "").trim();
+      if (!orderId) continue;
+      const storeDomain = String(item?.storeDomain || "").trim();
+      const storeName = String(item?.storeName || "").trim();
+      const key = `${orderId}|${storeDomain}|${storeName}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ orderId, storeDomain, storeName });
+    }
+    return out;
+  }
+
+  private shouldQueryStoreForOrder(
+    store: ShoplazzaStoreConfig,
+    order: ShoplazzaOrderRemarkRequest,
+    stores: ShoplazzaStoreConfig[]
+  ): boolean {
+    const hints = [order.storeDomain, order.storeName].map((item) => String(item || "").trim()).filter(Boolean);
+    if (hints.length === 0) return true;
+
+    const anyStoreMatchesHint = stores.some((candidate) => hints.some((hint) => this.storeMatchesHint(candidate, hint)));
+    if (!anyStoreMatchesHint) return true;
+    return hints.some((hint) => this.storeMatchesHint(store, hint));
+  }
+
+  private storeMatchesHint(store: ShoplazzaStoreConfig, rawHint: string): boolean {
+    const hint = this.normalizeStoreHint(rawHint);
+    if (!hint) return false;
+    const domain = store.storeDomain.toLowerCase();
+    const handle = domain.split(".")[0];
+    const normalizedDomain = this.normalizeShoplazzaDomain(hint);
+    return domain === hint || handle === hint || domain === normalizedDomain;
+  }
+
+  private normalizeStoreHint(value: string): string {
+    return value
+      .trim()
+      .toLowerCase()
+      .replace(/^https?:\/\//, "")
+      .split(/[/?#\s]/)[0];
+  }
+
+  private normalizeShoplazzaDomain(value: string): string {
+    const hint = this.normalizeStoreHint(value).replace(/\.myshoplazza\.com$/, ".myshoplaza.com");
+    if (!hint) return "";
+    return hint.includes(".") ? hint : `${hint}.myshoplaza.com`;
+  }
+
+  private hasStoreHint(order: ShoplazzaOrderRemarkRequest): boolean {
+    return Boolean(String(order.storeDomain || order.storeName || "").trim());
+  }
+
+  private async lookupOrderRemarkInStore(
+    store: ShoplazzaStoreConfig,
+    item: ShoplazzaOrderRemarkRequest,
+    phase: string
+  ): Promise<ShoplazzaOrderRemarkLookup | null> {
+    try {
+      const readback = await this.getOrderReadback(item.orderId, store.storeDomain);
+      const riskNote = this.extractRiskRemark(readback.order);
+      if (!riskNote) return null;
+      return {
+        orderId: item.orderId,
+        customer_note: riskNote,
+        storeDomain: store.storeDomain
+      };
+    } catch (error) {
+      this.logger.debug(
+        `Shoplazza risk note ${phase}跳过：store=${store.storeDomain} orderId=${item.orderId} ${this.formatAxiosError(error)}`
+      );
+      return null;
+    }
+  }
+
+  private async mapConcurrent<T, R>(
+    items: T[],
+    concurrency: number,
+    worker: (item: T) => Promise<R>
+  ): Promise<R[]> {
+    const results: R[] = [];
+    let nextIndex = 0;
+    const workerCount = Math.min(Math.max(concurrency, 1), items.length);
+    await Promise.all(
+      Array.from({ length: workerCount }, async () => {
+        while (nextIndex < items.length) {
+          const currentIndex = nextIndex;
+          nextIndex += 1;
+          results[currentIndex] = await worker(items[currentIndex]);
+        }
+      })
+    );
+    return results;
+  }
+
+  private extractRiskRemark(order: Record<string, unknown>): string {
+    const note = this.pickFirstString(order.note, order.order_note, order.memo, order.remark);
+    if (!note) return "";
+    const lines = note
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+    const riskLine = lines.find((line) => /⚠️?\s*【[^】]+】/.test(line));
+    if (riskLine) return riskLine;
+    const riskIndex = note.search(/⚠️?\s*【[^】]+】/);
+    return riskIndex >= 0 ? note.slice(riskIndex).trim() : "";
   }
 
   private pickFirstString(...values: unknown[]): string {

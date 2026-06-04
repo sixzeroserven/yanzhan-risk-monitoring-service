@@ -117,6 +117,13 @@ docker compose up -d --build
 
 示例变量见 `.env.example` / `.env.docker.example`。容器内执行脚本前请确认同一 `.env` 已包含上述变量（`docker compose` 的 `env_file` 会注入到 `app` 服务）。  
 
+### 马帮页面显示 Shopline 备注
+
+- 后端接口：`POST /api/order-remarks/shopline`，请求体 `{"orderIds":["2432773203308358576058"]}`，返回 Shopline `customer_note`。  
+- 可选安全配置：`.env` 设置 `ORDER_REMARK_LOOKUP_TOKEN` 后，请求头需带 `X-Order-Remark-Token`。为空则不校验。  
+- Chrome 插件目录：`chrome-extension/mabang-shopline-remark`。在 `chrome://extensions` 开启开发者模式后选择“加载已解压的扩展程序”。  
+- 插件设置页填写后端接口地址，例如 `https://your-domain.com/api/order-remarks/shopline`；如果后端配置了 token，也在设置页填同一个 token。  
+
 PayPal 同步示例：
 
 ```bash

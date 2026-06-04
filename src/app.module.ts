@@ -7,9 +7,18 @@ import { OrdersModule } from "./orders/orders.module";
 import { ShoplazzaModule } from "./shoplazza/shoplazza.module";
 import { WebhooksModule } from "./webhooks/webhooks.module";
 import { SchedulerModule } from "./scheduler/scheduler.module";
+import { OrderRemarksModule } from "./order-remarks/order-remarks.module";
 
 @Module({
-  imports: [DatabaseModule, BlacklistModule, OrdersModule, ShoplazzaModule, WebhooksModule, SchedulerModule],
+  imports: [
+    DatabaseModule,
+    BlacklistModule,
+    OrdersModule,
+    ShoplazzaModule,
+    WebhooksModule,
+    SchedulerModule,
+    OrderRemarksModule
+  ],
   controllers: [HealthController],
   providers: [EnvConfig]
 })

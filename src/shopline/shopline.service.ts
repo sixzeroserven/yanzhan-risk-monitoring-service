@@ -10,6 +10,18 @@ export type ShoplineStoreConfig = {
   orderIdPrefix?: string;
 };
 
+export type ShoplineCustomerNoteLookup = {
+  orderId: string;
+  customer_note: string;
+  storeDomain: string;
+};
+
+export type ShoplineCustomerNoteRequest = {
+  orderId: string;
+  storeDomain?: string;
+  storeName?: string;
+};
+
 @Injectable()
 export class ShoplineService implements OnModuleInit {
   private readonly logger = new Logger(ShoplineService.name);
@@ -217,10 +229,91 @@ export class ShoplineService implements OnModuleInit {
     return { order: {}, usedPath: "", raw: {} };
   }
 
+  async lookupCustomerNotes(orderIds: string[]): Promise<Record<string, ShoplineCustomerNoteLookup>> {
+    return this.lookupCustomerNotesForOrders(orderIds.map((orderId) => ({ orderId })));
+  }
+
+  async lookupCustomerNotesForOrders(
+    orders: ShoplineCustomerNoteRequest[]
+  ): Promise<Record<string, ShoplineCustomerNoteLookup>> {
+    const uniqueOrders = this.uniqueCustomerNoteRequests(orders);
+    const result: Record<string, ShoplineCustomerNoteLookup> = {};
+    if (uniqueOrders.length === 0) return result;
+
+    const stores = this.shoplineStores();
+    if (stores.length === 0) return result;
+
+    const pending = new Map(uniqueOrders.map((item) => [item.orderId, item]));
+    for (const store of stores) {
+      const idsForStore = Array.from(pending.values())
+        .filter((item) => this.shouldQueryStoreForOrder(store, item, stores))
+        .map((item) => item.orderId);
+
+      for (const batchIds of this.chunk(idsForStore, 50)) {
+        if (batchIds.length === 0) continue;
+        try {
+          const resp = await this.client(store.storeDomain).get(this.orderCollectionPath(batchIds));
+          const rows = this.pickOrderArray(resp.data);
+          const batchSet = new Set(batchIds);
+          for (const order of rows) {
+            const matchedId = this.matchRequestedOrderId(order, batchSet);
+            if (!matchedId || !pending.has(matchedId)) continue;
+            const customerNote = this.extractCustomerNote(order);
+            if (!customerNote) continue;
+            result[matchedId] = {
+              orderId: matchedId,
+              customer_note: customerNote,
+              storeDomain: store.storeDomain
+            };
+            pending.delete(matchedId);
+          }
+        } catch (error) {
+          this.logger.debug(
+            `Shopline risk_note 批量查询跳过：store=${store.storeDomain} count=${batchIds.length} ${this.formatAxiosError(error)}`
+          );
+        }
+      }
+      if (pending.size === 0) break;
+    }
+
+    const hintedStillPending = Array.from(pending.values()).filter((item) => this.hasStoreHint(item));
+    if (hintedStillPending.length > 0) {
+      // If the page's store hint was wrong or matched the wrong config, fall back to all stores.
+      for (const store of stores) {
+        const idsForStore = hintedStillPending.map((item) => item.orderId).filter((orderId) => pending.has(orderId));
+        for (const batchIds of this.chunk(idsForStore, 50)) {
+          if (batchIds.length === 0) continue;
+          try {
+            const resp = await this.client(store.storeDomain).get(this.orderCollectionPath(batchIds));
+            const rows = this.pickOrderArray(resp.data);
+            const batchSet = new Set(batchIds);
+            for (const order of rows) {
+              const matchedId = this.matchRequestedOrderId(order, batchSet);
+              if (!matchedId || !pending.has(matchedId)) continue;
+              const customerNote = this.extractCustomerNote(order);
+              if (!customerNote) continue;
+              result[matchedId] = {
+                orderId: matchedId,
+                customer_note: customerNote,
+                storeDomain: store.storeDomain
+              };
+              pending.delete(matchedId);
+            }
+          } catch (error) {
+            this.logger.debug(
+              `Shopline risk_note 兜底查询跳过：store=${store.storeDomain} count=${batchIds.length} ${this.formatAxiosError(error)}`
+            );
+          }
+        }
+        if (pending.size === 0) break;
+      }
+    }
+
+    return result;
+  }
+
   private readExistingOrderNote(orderId: string | number, storeDomain?: string): Promise<string> {
-    return this.getOrderReadback(orderId, storeDomain).then((readback) =>
-      this.pickFirstString(readback.order.note, readback.order.order_note, readback.order.customer_note, readback.order.memo, readback.order.remark)
-    );
+    return this.getOrderReadback(orderId, storeDomain).then((readback) => this.extractOrderNote(readback.order));
   }
 
   private client(storeDomain?: string): AxiosInstance {
@@ -239,10 +332,9 @@ export class ShoplineService implements OnModuleInit {
 
   private shoplineStores(): ShoplineStoreConfig[] {
     const fromWebhook = this.tryParseStoresJson(process.env.SHOPLINE_WEBHOOK_STORES_JSON || "", true);
-    if (fromWebhook.length > 0) return fromWebhook;
-
     const fromLegacy = this.tryParseStoresJson(process.env.SHOPLINE_STORES_JSON || "", false);
-    if (fromLegacy.length > 0) return fromLegacy;
+    const merged = this.mergeStores([...fromWebhook, ...fromLegacy]);
+    if (merged.length > 0) return merged;
 
     const domain = this.normalizeStoreDomain(
       process.env.SHOPLINE_STORE_DOMAIN || process.env.SHOPLINE_STORE_HANDLE || ""
@@ -258,6 +350,21 @@ export class ShoplineService implements OnModuleInit {
         orderIdPrefix: String(process.env.SHOPLINE_ORDER_ID_PREFIX || "").trim() || undefined
       }
     ];
+  }
+
+  private mergeStores(stores: ShoplineStoreConfig[]): ShoplineStoreConfig[] {
+    const merged = new Map<string, ShoplineStoreConfig>();
+    for (const store of stores) {
+      const key = store.storeDomain.toLowerCase();
+      const existing = merged.get(key);
+      merged.set(key, {
+        storeDomain: store.storeDomain,
+        accessToken: store.accessToken || existing?.accessToken || "",
+        webhookSecret: store.webhookSecret || existing?.webhookSecret || "",
+        orderIdPrefix: store.orderIdPrefix || existing?.orderIdPrefix
+      });
+    }
+    return Array.from(merged.values()).filter((item) => item.storeDomain && item.accessToken);
   }
 
   private tryParseStoresJson(raw: string, requireWebhookSecret: boolean): ShoplineStoreConfig[] {
@@ -302,8 +409,14 @@ export class ShoplineService implements OnModuleInit {
   }
 
   private orderReadPaths(orderId: string | number): string[] {
-    const collectionPath = `/admin/openapi/${encodeURIComponent(this.apiVersion())}/orders.json?ids=${encodeURIComponent(String(orderId))}`;
-    return [collectionPath, this.orderPath(orderId)];
+    return [this.orderCollectionPath(String(orderId)), this.orderPath(orderId)];
+  }
+
+  private orderCollectionPath(orderIds: string | string[]): string {
+    const ids = Array.isArray(orderIds) ? orderIds : [orderIds];
+    return `/admin/openapi/${encodeURIComponent(this.apiVersion())}/orders.json?ids=${ids
+      .map((item) => encodeURIComponent(item))
+      .join(",")}`;
   }
 
   private orderWritePaths(orderId: string | number): string[] {
@@ -384,6 +497,158 @@ export class ShoplineService implements OnModuleInit {
     return {};
   }
 
+  private pickMatchingOrder(data: Record<string, unknown>, orderId: string): Record<string, unknown> | null {
+    const rows = this.pickOrderArray(data);
+    for (const row of rows) {
+      if (this.isLikelyOrderMatch(row, orderId)) return row;
+    }
+    return null;
+  }
+
+  private uniqueCustomerNoteRequests(orders: ShoplineCustomerNoteRequest[]): ShoplineCustomerNoteRequest[] {
+    const seen = new Set<string>();
+    const out: ShoplineCustomerNoteRequest[] = [];
+    for (const item of orders) {
+      const orderId = String(item?.orderId || "").trim();
+      if (!orderId) continue;
+      const storeDomain = String(item?.storeDomain || "").trim();
+      const storeName = String(item?.storeName || "").trim();
+      const key = `${orderId}|${storeDomain}|${storeName}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ orderId, storeDomain, storeName });
+    }
+    return out;
+  }
+
+  private shouldQueryStoreForOrder(
+    store: ShoplineStoreConfig,
+    order: ShoplineCustomerNoteRequest,
+    stores: ShoplineStoreConfig[]
+  ): boolean {
+    const hints = [order.storeDomain, order.storeName].map((item) => String(item || "").trim()).filter(Boolean);
+    if (hints.length === 0) return true;
+
+    const anyStoreMatchesHint = stores.some((candidate) => hints.some((hint) => this.storeMatchesHint(candidate, hint)));
+    if (!anyStoreMatchesHint) return true;
+    return hints.some((hint) => this.storeMatchesHint(store, hint));
+  }
+
+  private hasStoreHint(order: ShoplineCustomerNoteRequest): boolean {
+    return Boolean(String(order.storeDomain || order.storeName || "").trim());
+  }
+
+  private storeMatchesHint(store: ShoplineStoreConfig, rawHint: string): boolean {
+    const hint = this.normalizeStoreHint(rawHint);
+    if (!hint) return false;
+    const domain = store.storeDomain.toLowerCase();
+    const handle = domain.split(".")[0];
+    return domain === hint || handle === hint || domain === this.normalizeStoreDomain(hint).toLowerCase();
+  }
+
+  private normalizeStoreHint(value: string): string {
+    return value
+      .trim()
+      .toLowerCase()
+      .replace(/^https?:\/\//, "")
+      .split(/[/?#\s]/)[0];
+  }
+
+  private chunk<T>(items: T[], size: number): T[][] {
+    const out: T[][] = [];
+    for (let i = 0; i < items.length; i += size) {
+      out.push(items.slice(i, i + size));
+    }
+    return out;
+  }
+
+  private pickOrderArray(data: unknown): Record<string, unknown>[] {
+    if (Array.isArray(data)) return data.filter((item) => item && typeof item === "object" && !Array.isArray(item)) as Record<string, unknown>[];
+    if (!data || typeof data !== "object") return [];
+    const record = data as Record<string, unknown>;
+    const candidates = [record.orders, record.data, record.items, record.results];
+    for (const item of candidates) {
+      if (Array.isArray(item)) return this.pickOrderArray(item);
+      if (item && typeof item === "object") {
+        const nested = item as Record<string, unknown>;
+        const nestedRows = this.pickOrderArray(nested.orders || nested.items || nested.results);
+        if (nestedRows.length > 0) return nestedRows;
+      }
+    }
+    return [];
+  }
+
+  private isLikelyOrderMatch(order: Record<string, unknown>, orderId: string): boolean {
+    const expected = String(orderId || "").trim();
+    if (!expected || Object.keys(order).length === 0) return false;
+    const candidates = [
+      order.id,
+      order.order_id,
+      order.orderId,
+      order.admin_graphql_api_id,
+      order.name,
+      order.order_name,
+      order.orderName,
+      order.order_number,
+      order.orderNo,
+      order.order_no,
+      order.number
+    ];
+    return candidates.some((value) => String(value || "").trim() === expected);
+  }
+
+  private matchRequestedOrderId(order: Record<string, unknown>, requested: Set<string>): string {
+    for (const orderId of requested) {
+      if (this.isLikelyOrderMatch(order, orderId)) return orderId;
+    }
+    return "";
+  }
+
+
+  private extractCustomerNote(order: Record<string, unknown>): string {
+    return this.pickNoteAttribute(order.note_attributes, ["risk_note"]);
+  }
+
+  private extractOrderNote(order: Record<string, unknown>): string {
+    return this.pickFirstString(
+      order.note,
+      order.order_note,
+      order.memo,
+      order.remark,
+      this.pickNoteAttribute(order.note_attributes, ["risk_note", "note", "remark", "customer_note", "customerNote"]),
+      this.pickNoteAttribute(order.noteAttributes, ["risk_note", "note", "remark", "customer_note", "customerNote"]),
+      order.customer_note,
+      order.customerNote
+    );
+  }
+
+  private pickNoteAttribute(attrs: unknown, names: string[]): string {
+    const targets = new Set(names.map((item) => item.toLowerCase()));
+    if (!attrs) return "";
+
+    if (Array.isArray(attrs)) {
+      for (const item of attrs) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+        const row = item as Record<string, unknown>;
+        const key = this.pickFirstString(row.name, row.key, row.code, row.label).toLowerCase();
+        if (!targets.has(key)) continue;
+        const value = this.pickFirstString(row.value, row.val, row.content, row.text);
+        if (value) return value;
+      }
+      return "";
+    }
+
+    if (typeof attrs === "object") {
+      const row = attrs as Record<string, unknown>;
+      for (const name of names) {
+        const value = this.pickFirstString(row[name]);
+        if (value) return value;
+      }
+    }
+
+    return "";
+  }
+
   private verifyHmacBySecret(rawBody: Buffer, providedSignature: string, secret: string): boolean {
     if (!secret) return false;
     const provided = providedSignature.trim().replace(/^sha256=/i, "");
@@ -409,7 +674,7 @@ export class ShoplineService implements OnModuleInit {
   }
 
   private apiVersion(): string {
-    return process.env.SHOPLINE_API_VERSION || "v20260301";
+    return process.env.SHOPLINE_API_VERSION || "v20260601";
   }
 
   private autoSubscribeWebhook(): boolean {
