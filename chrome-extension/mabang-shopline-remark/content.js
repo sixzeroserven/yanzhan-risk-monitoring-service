@@ -7,6 +7,7 @@
   const SCAN_DEBOUNCE_MS = 250;
   const EMPTY_RETRY_MS = 30000;
   const LOADING_RETRY_MS = 12000;
+  const ANCHOR_TEXT_PRIORITY = ["申报", "待处理", "已发货", "已作废", "打印", "拆分", "备注", "RMA", "退款"];
   const noteCache = new Map();
   const missingCache = new Map();
   const apiOrderCache = new Map();
@@ -202,19 +203,26 @@
     return Boolean(el?.getClientRects?.().length);
   }
 
-  function findDeclareElement(row) {
-    const candidates = Array.from(row.querySelectorAll("a,button,span,em,i,b,label,div")).filter(isVisibleElement);
-    const exact = candidates
-      .filter((el) => (el.textContent || "").trim() === "申报")
-      .sort((a, b) => (a.textContent || "").length - (b.textContent || "").length);
-    if (exact.length > 0) return exact[0];
+  function findActionAnchorElement(row) {
+    const candidates = Array.from(row.querySelectorAll("a,button,span,em,i,b,label,strong,td,div"))
+      .filter((el) => isVisibleElement(el) && !el.closest(".mb-sl-remark,.mb-sl-remark-loading,.mb-sl-remark-anchor"));
+    for (const label of ANCHOR_TEXT_PRIORITY) {
+      const exact = candidates
+        .filter((el) => (el.textContent || "").trim() === label)
+        .sort((a, b) => (a.textContent || "").length - (b.textContent || "").length);
+      if (exact.length > 0) return exact[0];
+    }
 
-    return candidates
-      .filter((el) => {
-        const text = (el.textContent || "").replace(/\s+/g, "");
-        return text.includes("申报") && text.length <= 12;
-      })
-      .sort((a, b) => (a.textContent || "").length - (b.textContent || "").length)[0] || null;
+    for (const label of ANCHOR_TEXT_PRIORITY) {
+      const loose = candidates
+        .filter((el) => {
+          const text = (el.textContent || "").replace(/\s+/g, "");
+          return text.includes(label) && text.length <= 12;
+        })
+        .sort((a, b) => (a.textContent || "").length - (b.textContent || "").length);
+      if (loose.length > 0) return loose[0];
+    }
+    return null;
   }
 
   function getRemarkAnchor(target, orderId) {
@@ -240,12 +248,13 @@
     const existing = row.querySelector(`.mb-sl-remark-anchor[data-order-id="${orderId}"]`);
     if (existing) return existing;
 
-    const declareEl = findDeclareElement(row);
-    if (declareEl?.parentNode) {
+    const actionEl = findActionAnchorElement(row);
+    if (actionEl) {
       const anchor = document.createElement("span");
       anchor.className = "mb-sl-remark-anchor mb-sl-remark-anchor--action";
       anchor.dataset.orderId = orderId;
-      declareEl.parentNode.insertBefore(anchor, declareEl.nextSibling);
+      // Put the label inside the short action/status element so it is visually on its right.
+      actionEl.appendChild(anchor);
       return anchor;
     }
 
