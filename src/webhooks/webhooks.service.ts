@@ -83,19 +83,27 @@ export class WebhooksService {
       if (!scoreExclusion.excluded) {
         const riskScore = await this.blacklistService.scoreByEmail(scoreExclusion.email);
         const scoreThreshold = this.riskScoreNoteThreshold();
+        const shouldWriteSuggestedNoShipNote = Boolean(
+          riskScore.scored && riskScore.suggestedNoShip && riskScore.remark
+        );
         const shouldWriteRiskNote = riskScore.scored && riskScore.totalScore >= scoreThreshold;
-        const noteResult = shouldWriteRiskNote
+        const noteToWrite = shouldWriteSuggestedNoShipNote
+          ? String(riskScore.remark)
+          : shouldWriteRiskNote
+            ? this.buildRiskScoreNote(riskScore, scoreThreshold)
+            : "";
+        const noteResult = noteToWrite
           ? await this.writeOrderNote(
               orderId,
               orderIdText,
-              this.buildRiskScoreNote(riskScore, scoreThreshold),
+              noteToWrite,
               storeDomain,
               platform,
               order
             )
           : { noteUpdated: false, noteConfirmed: false };
         this.logger.log(
-          `订单处理结果：topic=orders/update orderId=${orderIdText} blacklisted=false scoreExcluded=false riskScore=${String(riskScore.totalScore)} riskScoreNote=${String(shouldWriteRiskNote)} noteUpdated=${String(noteResult.noteUpdated)} noteConfirmed=${String(noteResult.noteConfirmed)}`
+          `订单处理结果：topic=orders/update orderId=${orderIdText} blacklisted=false scoreExcluded=false riskScore=${String(riskScore.totalScore)} suggestedNoShipNote=${String(shouldWriteSuggestedNoShipNote)} riskScoreNote=${String(shouldWriteRiskNote && !shouldWriteSuggestedNoShipNote)} noteUpdated=${String(noteResult.noteUpdated)} noteConfirmed=${String(noteResult.noteConfirmed)}`
         );
         this.markRiskFingerprintProcessed(scopedOrderId, fingerprint);
         return {
@@ -103,7 +111,8 @@ export class WebhooksService {
           scoreExcluded: false,
           orderId,
           riskScore,
-          riskScoreNote: shouldWriteRiskNote,
+          suggestedNoShipNote: shouldWriteSuggestedNoShipNote,
+          riskScoreNote: shouldWriteRiskNote && !shouldWriteSuggestedNoShipNote,
           noteUpdated: noteResult.noteUpdated,
           noteConfirmed: noteResult.noteConfirmed
         };

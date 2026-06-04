@@ -11,6 +11,7 @@
   const missingCache = new Map();
   const apiOrderCache = new Map();
   const requestInFlight = new Set();
+  const pendingLoadingIds = new Set();
   let scanTimer = null;
   let inFlight = false;
 
@@ -351,15 +352,33 @@
   }
 
   function renderLoadingForOrderIds(orderIds) {
-    const ids = Array.from(new Set(orderIds.filter(Boolean)));
+    for (const id of new Set(orderIds.filter(Boolean))) {
+      if (!noteCache.has(id) && !document.querySelector(`.mb-sl-remark[data-order-id="${id}"]`)) {
+        pendingLoadingIds.add(id);
+      }
+    }
+    flushPendingLoadings();
+  }
+
+  function flushPendingLoadings() {
+    const ids = Array.from(pendingLoadingIds);
     if (ids.length === 0) return;
     const rows = sortPreferredRows(orderContainers());
     for (const id of ids) {
-      if (noteCache.has(id) || document.querySelector(`.mb-sl-remark[data-order-id="${id}"]`)) continue;
-      if (document.querySelector(`.mb-sl-remark-loading[data-order-id="${id}"]`)) continue;
+      if (noteCache.has(id) || document.querySelector(`.mb-sl-remark[data-order-id="${id}"]`)) {
+        pendingLoadingIds.delete(id);
+        continue;
+      }
+      if (document.querySelector(`.mb-sl-remark-loading[data-order-id="${id}"]`)) {
+        pendingLoadingIds.delete(id);
+        continue;
+      }
       const row = rows.find((item) => collectSearchText(item).includes(id));
       if (!row) continue;
-      if (row.querySelector(".mb-sl-remark,.mb-sl-remark-loading")) continue;
+      if (row.querySelector(".mb-sl-remark,.mb-sl-remark-loading")) {
+        pendingLoadingIds.delete(id);
+        continue;
+      }
       const wrap = document.createElement("span");
       wrap.className = "mb-sl-remark-loading";
       wrap.dataset.orderId = id;
@@ -371,6 +390,7 @@
       wrap.appendChild(text);
       getPlacementAnchor(row, id).appendChild(wrap);
       removeDuplicateLoadings(id, row);
+      pendingLoadingIds.delete(id);
       row.dataset.shoplineRemarkScanned = "loading";
       row.dataset.shoplineRemarkScannedAt = String(Date.now());
     }
@@ -378,6 +398,7 @@
 
   function removeLoadingForOrderIds(orderIds) {
     for (const id of new Set(orderIds.filter(Boolean))) {
+      pendingLoadingIds.delete(id);
       for (const item of document.querySelectorAll(`.mb-sl-remark-loading[data-order-id="${id}"]`)) {
         const row = item.closest("tr,.order-item,.order-list-item,.orderData,[data-order-id],[data-id]");
         item.remove();
@@ -387,6 +408,12 @@
         }
       }
     }
+  }
+
+  function resolvedOrderIds(orderRequests) {
+    return unique(orderRequests
+      .filter((item) => noteCache.has(item.orderId) || isMissingCached(requestKey(item)))
+      .map((item) => item.orderId));
   }
 
   function renderCachedNotesForOrderIds(orderIds) {
@@ -573,7 +600,7 @@
       if (orders.length > 0) {
         renderLoadingForOrderIds(orders.map((item) => item.orderId));
         fetchResult = await fetchNotes(orders);
-        removeLoadingForOrderIds(orders.map((item) => item.orderId));
+        removeLoadingForOrderIds(resolvedOrderIds(orders));
       }
 
       let hasDeferredRows = false;
@@ -642,6 +669,7 @@
         return Array.from(mutation.addedNodes || []).every(isOwnRemarkNode);
       });
       if (onlyOwnChanges) return;
+      flushPendingLoadings();
       scheduleScan();
     });
     observer.observe(document.documentElement, {
@@ -686,7 +714,7 @@
     renderLoadingForOrderIds(validOrders.map((item) => item.orderId));
     fetchNotes(validOrders)
       .then(() => {
-        removeLoadingForOrderIds(validOrders.map((item) => item.orderId));
+        removeLoadingForOrderIds(resolvedOrderIds(validOrders));
         retryRenderCachedNotes(validOrders.map((item) => item.orderId));
         scheduleScan();
       })

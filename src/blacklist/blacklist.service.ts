@@ -82,6 +82,13 @@ type RiskOrderRow = {
   detail_address: string | null;
 };
 
+type SuggestedNoShipResult = {
+  suggestedNoShip: boolean;
+  ruleCode: string | null;
+  reasons: string[];
+  remark: string;
+};
+
 const DEFAULT_RISK_SCORE_CONFIG: RiskScoreConfig = {
   paidOrderCount: {
     min: 1,
@@ -289,9 +296,10 @@ export class BlacklistService {
 
     const relatedEmailCount = await this.countRelatedEmailsByAddress(email);
     const score = this.calculateRiskScore(config, orders, relatedEmailCount);
+    const suggestedNoShip = this.evaluateSuggestedNoShip(score.details);
 
     this.logger.log(
-      `用户风险评分完成：email=${email} totalScore=${score.totalScore} durationMs=${Date.now() - startedAt} details=${JSON.stringify(score.details)}`
+      `用户风险评分完成：email=${email} totalScore=${score.totalScore} suggestedNoShip=${String(suggestedNoShip.suggestedNoShip)} durationMs=${Date.now() - startedAt} details=${JSON.stringify(score.details)}`
     );
     return {
       email,
@@ -299,7 +307,12 @@ export class BlacklistService {
       excluded: false,
       excludeReason: null,
       totalScore: score.totalScore,
-      details: score.details
+      details: score.details,
+      suggestedNoShip: suggestedNoShip.suggestedNoShip,
+      noShip: suggestedNoShip.suggestedNoShip,
+      suggestedNoShipRuleCode: suggestedNoShip.ruleCode,
+      suggestedNoShipReasons: suggestedNoShip.reasons,
+      remark: suggestedNoShip.remark
     };
   }
 
@@ -633,6 +646,7 @@ export class BlacklistService {
       INNER JOIN orders o ON BINARY o.order_id = BINARY oa.order_id
       WHERE LOWER(TRIM(oa.email)) = ?
         AND o.order_created_time IS NOT NULL
+        AND o.order_created_time >= DATE_SUB(NOW(), INTERVAL 180 DAY)
       ORDER BY o.order_id ASC, o.order_created_time DESC, o.id DESC
     `,
       email
@@ -671,6 +685,7 @@ export class BlacklistService {
         INNER JOIN orders o ON BINARY o.order_id = BINARY oa.order_id
         WHERE LOWER(TRIM(oa.email)) = ?
           AND o.order_created_time IS NOT NULL
+          AND o.order_created_time >= DATE_SUB(NOW(), INTERVAL 180 DAY)
           AND TRIM(COALESCE(oa.detail_address, '')) <> ''
       ) addr
         ON LOWER(TRIM(COALESCE(oa2.province, ''))) = addr.province_key
@@ -679,6 +694,7 @@ export class BlacklistService {
       WHERE oa2.email IS NOT NULL
         AND TRIM(oa2.email) <> ''
         AND o2.order_created_time IS NOT NULL
+        AND o2.order_created_time >= DATE_SUB(NOW(), INTERVAL 180 DAY)
     `,
       email
     )) as Array<Record<string, unknown>>;
@@ -753,6 +769,7 @@ export class BlacklistService {
 
     const totalScore = paidScore + unfinishedScore + intervalScore + relatedScore + ipScore;
     const details = {
+      analysisWindowDays: 180,
       totalOrders,
       paidCount,
       orderedCount,
@@ -821,6 +838,68 @@ export class BlacklistService {
     };
 
     return { totalScore: this.roundScore(totalScore), details };
+  }
+
+  private evaluateSuggestedNoShip(details: Record<string, unknown>): SuggestedNoShipResult {
+    const paidCount = this.toNumber(details.paidCount);
+    const totalOrders = this.toNumber(details.totalOrders);
+    const orderedCount = this.toNumber(details.orderedCount);
+    const unfinishedRatio = this.toNumber(this.asObject(details.unfinishedRatio).value);
+    const intervals = this.asObject(details.paidOrderIntervals);
+    const daysOver7 = this.toNumber(this.asObject(intervals.daysOver7).value);
+    const relatedAccountCount = this.toNumber(this.asObject(details.relatedAccountCount).value);
+    const ipSwitchFrequency = this.asObject(details.ipSwitchFrequency);
+    const ipFrequency = this.toNumber(ipSwitchFrequency.value);
+    const distinctIpCount = this.toNumber(ipSwitchFrequency.distinctIpCount);
+
+    let ruleCode: string | null = null;
+    const reasons: string[] = [];
+
+    if (paidCount >= 10 && daysOver7 < 3) {
+      ruleCode = "paid_ge_10_low_long_interval";
+      reasons.push(`已付款订单 ${this.formatRiskNumber(paidCount)} 单 >= 10 单`);
+      reasons.push(`大于7天下单间隔次数 ${this.formatRiskNumber(daysOver7)} 个 < 3 个`);
+    } else if (paidCount >= 5 && paidCount < 10) {
+      if (unfinishedRatio > 0.3) {
+        reasons.push(`未完成订单占比 ${this.formatRiskPercent(unfinishedRatio)} > 30%`);
+      }
+      if (relatedAccountCount >= 3) {
+        reasons.push(`关联账号数 ${this.formatRiskNumber(relatedAccountCount)} >= 3`);
+      }
+      if (daysOver7 === 0) {
+        reasons.push("大于7天下单间隔次数为 0");
+      }
+      if (Math.abs(ipFrequency - 1) < 0.000001) {
+        reasons.push("IP切换频率为 1");
+      }
+      if (reasons.length > 0) ruleCode = "paid_5_to_9_abnormal";
+    } else if (paidCount < 5) {
+      if (unfinishedRatio > 0.5) {
+        reasons.push(`未完成订单占比 ${this.formatRiskPercent(unfinishedRatio)} > 50%`);
+      }
+      if (relatedAccountCount >= 3) {
+        reasons.push(`关联账号数 ${this.formatRiskNumber(relatedAccountCount)} >= 3`);
+      }
+      if (reasons.length > 0) ruleCode = "paid_lt_5_abnormal";
+    }
+
+    if (!ruleCode) {
+      return { suggestedNoShip: false, ruleCode: null, reasons: [], remark: "" };
+    }
+
+    return {
+      suggestedNoShip: true,
+      ruleCode,
+      reasons,
+      remark: [
+        `⚠️【建议不发货】180天内命中建议不发货规则：${reasons.join("；")}。`,
+        `订单数：有效订单 ${this.formatRiskNumber(totalOrders)} 单，已付款订单 ${this.formatRiskNumber(paidCount)} 单，未完成/未付款订单 ${this.formatRiskNumber(orderedCount)} 单。`,
+        `未完成订单占比：${this.formatRiskPercent(unfinishedRatio)}。`,
+        `时间间隔订单数：大于7天 ${this.formatRiskNumber(daysOver7)} 个。`,
+        `关联账号数：${this.formatRiskNumber(relatedAccountCount)}。`,
+        `IP切换频率：${this.formatRiskNumber(ipFrequency)}（已付款订单数 ${this.formatRiskNumber(paidCount)} / 不同IP数 ${this.formatRiskNumber(distinctIpCount)}）。`
+      ].join("\n")
+    };
   }
 
   private countPaidOrderIntervals(rows: RiskOrderRow[]): {
@@ -912,6 +991,16 @@ export class BlacklistService {
 
   private roundScore(value: number): number {
     return Math.round(value * 1000000) / 1000000;
+  }
+
+  private formatRiskNumber(value: unknown): string {
+    const numberValue = this.toNumber(value);
+    if (Number.isInteger(numberValue)) return String(numberValue);
+    return String(Math.round(numberValue * 10000) / 10000);
+  }
+
+  private formatRiskPercent(value: unknown): string {
+    return `${this.formatRiskNumber(this.toNumber(value) * 100)}%`;
   }
 
   private configuredNonRegularEmailDomains(): string[] {
