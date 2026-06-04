@@ -108,9 +108,33 @@ NO_PAYMENT_VALUES = {
     "manual",
 }
 
+TEST_ORDER_NAMES = {
+    "test 1",
+    "test test",
+    "test1 test1",
+    "test1234 test1234",
+    "test22 test22",
+    "ldy ldy",
+    "test",
+    "test 123",
+    "uuu test",
+}
+
 
 def truthy_env(name: str) -> bool:
     return (os.getenv(name) or "").strip().lower() in ("1", "true", "yes", "y")
+
+
+def normalize_test_name(value: Optional[str]) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def test_order_reason(row: Dict[str, Any]) -> Optional[str]:
+    for field in ("buyer_name", "contact_name"):
+        normalized = normalize_test_name(row.get(field))
+        if normalized in TEST_ORDER_NAMES:
+            return f"{field}={normalized}"
+    return None
 
 
 def parse_datetime_arg(value: Optional[str], end_of_day: bool = False) -> Optional[datetime]:
@@ -717,6 +741,17 @@ def process_one_order(
     row = extract_base_order_row(platform, store, base)
     if not row:
         add_stat(stats, "skipped_no_order_id")
+        return
+    reason = test_order_reason(row)
+    if reason:
+        add_stat(stats, "test_orders_skipped")
+        logger.info(
+            "skip test order platform=%s store=%s order_id=%s reason=%s",
+            platform,
+            store.get("storeDomain", "-"),
+            row.get("order_id"),
+            reason,
+        )
         return
     if debug_fetch and debug_budget[0] != 0:
         logger.info("[debug-fetch] %s", format_debug(platform, store, raw, base, row))
