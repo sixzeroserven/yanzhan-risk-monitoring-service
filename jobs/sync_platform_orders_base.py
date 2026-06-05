@@ -50,6 +50,9 @@ ORDER_COLUMNS: Tuple[Tuple[str, str, str], ...] = (
     ("payment_method", "VARCHAR(100) DEFAULT NULL COMMENT '支付方式'", "device"),
     ("payment_channel", "VARCHAR(100) DEFAULT NULL COMMENT '支付渠道'", "payment_method"),
     ("variant_id", "VARCHAR(255) DEFAULT NULL COMMENT 'SKU/变体 ID（多行商品取首行）'", "payment_channel"),
+    ("logistics_tracking_number", "VARCHAR(255) DEFAULT NULL COMMENT '物流单号'", "variant_id"),
+    ("logistics_carrier_name", "VARCHAR(200) DEFAULT NULL COMMENT '物流商名称'", "logistics_tracking_number"),
+    ("logistics_created_time", "DATETIME DEFAULT NULL COMMENT '物流/履约创建时间'", "logistics_carrier_name"),
     ("buyer_name", "VARCHAR(200) DEFAULT NULL COMMENT '买家姓名'", "package_number"),
     ("contact_name", "VARCHAR(200) DEFAULT NULL COMMENT '联系人姓名'", "buyer_name"),
     ("buyer_account", "VARCHAR(200) DEFAULT NULL COMMENT '买家账号'", "contact_name"),
@@ -66,6 +69,9 @@ ORDER_UPDATE_COLUMNS = (
     "payment_method",
     "payment_channel",
     "variant_id",
+    "logistics_tracking_number",
+    "logistics_carrier_name",
+    "logistics_created_time",
     "buyer_name",
     "contact_name",
     "buyer_account",
@@ -192,6 +198,9 @@ def ensure_tables(cursor) -> None:
             payment_method VARCHAR(100) DEFAULT NULL COMMENT '支付方式',
             payment_channel VARCHAR(100) DEFAULT NULL COMMENT '支付渠道',
             variant_id VARCHAR(255) DEFAULT NULL COMMENT 'SKU/变体 ID（多行商品取首行）',
+            logistics_tracking_number VARCHAR(255) DEFAULT NULL COMMENT '物流单号',
+            logistics_carrier_name VARCHAR(200) DEFAULT NULL COMMENT '物流商名称',
+            logistics_created_time DATETIME DEFAULT NULL COMMENT '物流/履约创建时间',
             package_number VARCHAR(100) DEFAULT NULL COMMENT '包裹号',
             buyer_name VARCHAR(200) DEFAULT NULL COMMENT '买家姓名',
             contact_name VARCHAR(200) DEFAULT NULL COMMENT '联系人姓名',
@@ -293,6 +302,37 @@ def first_str(*values: Any, max_len: Optional[int] = None) -> Optional[str]:
         if text:
             return text[:max_len] if max_len is not None else text
     return None
+
+
+def first_nested_str(*values: Any, max_len: Optional[int] = None) -> Optional[str]:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, list):
+            hit = first_nested_str(*value, max_len=max_len)
+            if hit:
+                return hit
+            continue
+        if isinstance(value, dict):
+            continue
+        text = str(value).strip()
+        if text:
+            return text[:max_len] if max_len is not None else text
+    return None
+
+
+def case_pick(record: Dict[str, Any], *keys: str) -> Any:
+    if not record:
+        return None
+    wanted = {key.lower() for key in keys}
+    for key, value in record.items():
+        if str(key).lower() in wanted:
+            return value
+    return None
+
+
+def first_field(record: Dict[str, Any], keys: Tuple[str, ...], max_len: Optional[int] = None) -> Optional[str]:
+    return first_nested_str(*(case_pick(record, key) for key in keys), max_len=max_len)
 
 
 def join_name(first: Any, last: Any) -> Optional[str]:
@@ -599,6 +639,188 @@ def extract_payment_overrides(order: Dict[str, Any]) -> Dict[str, Optional[str]]
     return {"payment_method": method, "payment_channel": channel}
 
 
+LOGISTICS_CONTAINER_KEYS = (
+    "fulfillment",
+    "fulfillments",
+    "shipment",
+    "shipments",
+    "shipping",
+    "shipping_line",
+    "shippingLine",
+    "shipping_lines",
+    "shippingLines",
+    "logistics",
+    "logistic",
+    "logistics_info",
+    "logisticsInfo",
+    "delivery",
+    "deliveries",
+    "delivery_info",
+    "deliveryInfo",
+    "package",
+    "packages",
+    "tracking",
+    "tracking_info",
+    "trackingInfo",
+)
+
+TRACKING_NUMBER_KEYS = (
+    "tracking_number",
+    "trackingNumber",
+    "tracking_no",
+    "trackingNo",
+    "tracking_code",
+    "trackingCode",
+    "tracking_numbers",
+    "trackingNumbers",
+    "waybill_number",
+    "waybillNumber",
+    "waybill_no",
+    "waybillNo",
+    "logistics_no",
+    "logisticsNo",
+    "logistics_number",
+    "logisticsNumber",
+    "express_no",
+    "expressNo",
+    "track_number",
+    "trackNumber",
+)
+
+CARRIER_NAME_KEYS = (
+    "tracking_company",
+    "trackingCompany",
+    "tracking_company_name",
+    "trackingCompanyName",
+    "carrier",
+    "carrier_name",
+    "carrierName",
+    "logistics_company",
+    "logisticsCompany",
+    "logistics_company_name",
+    "logisticsCompanyName",
+    "shipping_company",
+    "shippingCompany",
+)
+
+LOGISTICS_TIME_KEYS = (
+    "logistics_created_time",
+    "logisticsCreatedTime",
+    "shipment_created_at",
+    "shipmentCreatedAt",
+    "fulfillment_created_at",
+    "fulfillmentCreatedAt",
+    "created_at",
+    "createdAt",
+    "create_time",
+    "createTime",
+    "created_time",
+    "createdTime",
+    "fulfilled_at",
+    "fulfilledAt",
+    "shipped_at",
+    "shippedAt",
+    "updated_at",
+    "updatedAt",
+    "update_time",
+    "updateTime",
+)
+
+
+def parse_optional_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo else value
+    text = first_nested_str(value)
+    if not text:
+        return None
+    normalized = text.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(normalized)
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def iter_logistics_objects(order: Dict[str, Any]) -> List[Dict[str, Any]]:
+    seen = set()
+    out: List[Dict[str, Any]] = []
+
+    def add(value: Any, depth: int = 0) -> None:
+        if depth > 4 or value is None:
+            return
+        if isinstance(value, list):
+            for item in value:
+                add(item, depth)
+            return
+        if not isinstance(value, dict):
+            return
+        marker = id(value)
+        if marker in seen:
+            return
+        seen.add(marker)
+        out.append(value)
+        for key in LOGISTICS_CONTAINER_KEYS:
+            nested = case_pick(value, key)
+            if nested is not None:
+                add(nested, depth + 1)
+
+    # Fulfillment/shipment-like containers have the best logistics data. Use
+    # order-level fields only after those candidates.
+    for key in LOGISTICS_CONTAINER_KEYS:
+        nested = case_pick(order, key)
+        if nested is not None:
+            add(nested)
+    add(order)
+    return out
+
+
+def extract_logistics_fields(order: Dict[str, Any]) -> Dict[str, Optional[Any]]:
+    tracking_number: Optional[str] = None
+    carrier_name: Optional[str] = None
+    created_time: Optional[datetime] = None
+
+    for item in iter_logistics_objects(order):
+        if not tracking_number:
+            tracking_number = first_field(item, TRACKING_NUMBER_KEYS, max_len=255)
+        if not carrier_name:
+            carrier_name = first_field(item, CARRIER_NAME_KEYS, max_len=200)
+        if not created_time:
+            time_keys = LOGISTICS_TIME_KEYS
+            if item is order:
+                time_keys = (
+                    "logistics_created_time",
+                    "logisticsCreatedTime",
+                    "shipment_created_at",
+                    "shipmentCreatedAt",
+                    "fulfillment_created_at",
+                    "fulfillmentCreatedAt",
+                    "shipped_at",
+                    "shippedAt",
+                )
+            for key in time_keys:
+                created_time = parse_optional_datetime(case_pick(item, key))
+                if created_time:
+                    break
+        if tracking_number and carrier_name and created_time:
+            break
+
+    return {
+        "logistics_tracking_number": tracking_number,
+        "logistics_carrier_name": carrier_name,
+        "logistics_created_time": created_time,
+    }
+
+
 def extract_base_order_row(platform: str, store: Dict[str, str], order: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     order_id = pick_order_id(platform, order, store)
     if not order_id:
@@ -619,6 +841,7 @@ def extract_base_order_row(platform: str, store: Dict[str, str], order: Dict[str
     for key, value in payment_overrides.items():
         if value and not row.get(key):
             row[key] = value
+    row.update(extract_logistics_fields(order))
     row.update(extract_customer_fields(order))
     return row
 

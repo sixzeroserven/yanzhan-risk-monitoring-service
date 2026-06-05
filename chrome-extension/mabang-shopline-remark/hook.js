@@ -2,12 +2,18 @@
   const SOURCE = "mabang-shopline-remark-hook";
   const ORDER_API_RE = /mod=order\.oTc/i;
 
+  function decodeHtmlEntities(value) {
+    const el = document.createElement("textarea");
+    el.innerHTML = String(value || "");
+    return el.value;
+  }
+
   function stripHtml(value) {
     const text = String(value || "");
-    if (!text.includes("<")) return text.trim();
+    if (!text.includes("<")) return decodeHtmlEntities(text).trim();
     const el = document.createElement("div");
     el.innerHTML = text;
-    return (el.textContent || el.innerText || "").trim();
+    return decodeHtmlEntities(el.textContent || el.innerText || "").trim();
   }
 
   function findOrderDataList(value, depth = 0) {

@@ -102,6 +102,16 @@
     return "";
   }
 
+  function decodeHtmlEntities(value) {
+    const el = document.createElement("textarea");
+    el.innerHTML = String(value || "");
+    return el.value;
+  }
+
+  function normalizeNote(value) {
+    return decodeHtmlEntities(value).trim();
+  }
+
   function hasOrderId(text) {
     ORDER_ID_RE.lastIndex = 0;
     return ORDER_ID_RE.test(text || "");
@@ -263,7 +273,7 @@
 
 
   function noteTitle(note) {
-    const text = String(note || "").trim();
+    const text = normalizeNote(note);
     const hit = text.match(/(?:⚠️)?\s*【[^】]+】/);
     if (hit) {
       const title = hit[0].trim();
@@ -277,7 +287,7 @@
   }
 
   function noteDetail(note) {
-    const text = String(note || "").trim();
+    const text = normalizeNote(note);
     const title = noteTitle(text);
     const withoutIconTitle = text.replace(/(?:⚠️)?\s*【[^】]+】/, "").trim();
     return withoutIconTitle || text || title;
@@ -327,20 +337,21 @@
   function renderNote(row, orderId, note) {
     if (!note || row.querySelector(`.mb-sl-remark[data-order-id="${orderId}"]`)) return;
     removeLoadingForOrderIds([orderId]);
+    const normalizedNote = normalizeNote(note);
     const wrap = document.createElement("span");
     wrap.className = "mb-sl-remark";
     wrap.dataset.orderId = orderId;
-    wrap.dataset.note = note;
+    wrap.dataset.note = normalizedNote;
 
     const text = document.createElement("span");
     text.className = "mb-sl-remark-text";
-    text.textContent = noteTitle(note);
+    text.textContent = noteTitle(normalizedNote);
 
     wrap.appendChild(text);
     wrap.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      showRemarkPopup(wrap, note);
+      showRemarkPopup(wrap, normalizedNote);
     });
     getPlacementAnchor(row, orderId).appendChild(wrap);
     row.dataset.shoplineRemarkScanned = "done";
@@ -484,7 +495,7 @@
   }
 
   function pickInlineNote(item) {
-    return String(item?.customer_note || item?.customerNote || item?.note || item?.orderRemarkText || "").trim();
+    return normalizeNote(item?.customer_note || item?.customerNote || item?.note || item?.orderRemarkText || "");
   }
 
   function chunk(values, size) {
@@ -561,8 +572,8 @@
             for (const request of batch) {
               const id = request.orderId;
               const dataItem = data[id];
-              const note = dataItem && (dataItem.customer_note || dataItem.customerNote);
-              if (note) noteCache.set(id, String(note));
+              const note = dataItem && normalizeNote(dataItem.customer_note || dataItem.customerNote);
+              if (note) noteCache.set(id, note);
               else markMissing(requestKey(request));
             }
           } catch (error) {
@@ -708,7 +719,7 @@
         platform: String(item?.platform || "").trim().toLowerCase(),
         orderId: String(item?.orderId || "").trim(),
         storeName: cleanStoreHint(item?.storeName || ""),
-        customer_note: String(item?.customer_note || item?.customerNote || "").trim()
+        customer_note: normalizeNote(item?.customer_note || item?.customerNote || "")
       }))
       .filter((item) => ["shopline", "shoplazza"].includes(item.platform) && /^\d{10,40}$/.test(item.orderId));
     if (validOrders.length === 0) return;
