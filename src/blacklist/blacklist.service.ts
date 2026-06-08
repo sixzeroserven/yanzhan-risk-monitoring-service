@@ -141,7 +141,6 @@ export class BlacklistService {
       email: normalizeEmail(input.email),
       phoneNumber: normalizePhone(input.phone_number),
       detailAddress: normalizeAddress(input.detail_address),
-      address2: normalizeAddress(input.address2),
       fingerprint: safeString(
         input.device_fingerprint || input.fingerprint || input.deviceFingerprint
       )
@@ -187,7 +186,6 @@ export class BlacklistService {
       email: normalizeEmail(email),
       phoneNumber: normalizePhone(phoneNumber),
       detailAddress: normalizeAddress(shipping.address1 || billing.detail_address),
-      address2: normalizeAddress(shipping.address2 || billing.address2),
       fingerprint: safeString(getDeviceFingerprint(order))
     };
     return this.checkByContact(contact);
@@ -228,6 +226,15 @@ export class BlacklistService {
 
   async scoreByInput(input: Record<string, unknown>) {
     return this.scoreByEmail(input.email);
+  }
+
+  async checkEmailRiskByInput(input: Record<string, unknown>) {
+    const emails = this.extractEmailRiskInputs(input);
+    const data: Record<string, unknown> = {};
+    for (const email of emails) {
+      data[email] = await this.checkOneEmailRisk(email);
+    }
+    return { success: true, count: emails.length, data };
   }
 
   async scoreByEmail(value: unknown) {
@@ -313,6 +320,106 @@ export class BlacklistService {
       suggestedNoShipRuleCode: suggestedNoShip.ruleCode,
       suggestedNoShipReasons: suggestedNoShip.reasons,
       remark: suggestedNoShip.remark
+    };
+  }
+
+  private async checkOneEmailRisk(email: string): Promise<Record<string, unknown>> {
+    const nonRegularEmail = this.checkNonRegularEmail(email);
+    const blacklistHits = email ? await this.findByEmail(email) : [];
+    const disputeHits = email ? await this.findDisputesByEmail(email) : [];
+    const blacklisted = blacklistHits.length > 0;
+    const disputed = disputeHits.length > 0;
+    const base = {
+      email,
+      blacklisted,
+      disputed,
+      blacklistHits,
+      disputeHits
+    };
+
+    if (blacklisted) {
+      const hitTypes = [...new Set(blacklistHits.map((item) => item.hit_type).filter(Boolean))];
+      return {
+        ...base,
+        scored: false,
+        totalScore: 0,
+        suggestedNoShip: false,
+        shouldShip: false,
+        shipDecision: "blocked",
+        decisionText: "黑名单拦截",
+        reason: "blacklist",
+        remark: `⚠️【黑名单拦截】命中规则：${hitTypes.join("、") || "email"}。该用户被识别为黑名单，请谨慎处理！`
+      };
+    }
+
+    if (disputed) {
+      return {
+        ...base,
+        scored: false,
+        totalScore: 0,
+        suggestedNoShip: false,
+        shouldShip: false,
+        shipDecision: "dispute_user",
+        decisionText: "争议用户，建议不发货",
+        reason: "dispute_user",
+        remark: this.buildDisputeRemark(disputeHits)
+      };
+    }
+
+    if (nonRegularEmail.excluded) {
+      return {
+        ...base,
+        scored: false,
+        totalScore: 0,
+        suggestedNoShip: false,
+        shouldShip: null,
+        shipDecision: "unknown",
+        decisionText: "邮箱异常，需要人工判断",
+        reason: "non_regular_email",
+        details: nonRegularEmail.details || {},
+        remark: nonRegularEmail.remark
+      };
+    }
+
+    const scoreResult = (await this.scoreByEmail(email)) as Record<string, unknown>;
+    const scored = scoreResult.scored === true;
+    const suggestedNoShip = scoreResult.suggestedNoShip === true || scoreResult.noShip === true;
+
+    if (suggestedNoShip) {
+      return {
+        ...base,
+        ...scoreResult,
+        blacklisted,
+        disputed,
+        shouldShip: false,
+        shipDecision: "suggest_no_ship",
+        decisionText: "建议不发货",
+        reason: "suggested_no_ship"
+      };
+    }
+
+    if (scored) {
+      return {
+        ...base,
+        ...scoreResult,
+        blacklisted,
+        disputed,
+        shouldShip: true,
+        shipDecision: "allow",
+        decisionText: "未命中黑名单/争议/建议不发货规则",
+        reason: null
+      };
+    }
+
+    return {
+      ...base,
+      ...scoreResult,
+      blacklisted,
+      disputed,
+      shouldShip: null,
+      shipDecision: "unknown",
+      decisionText: "数据不足，需要人工判断",
+      reason: scoreResult.excludeReason || "unknown"
     };
   }
 
@@ -414,14 +521,12 @@ export class BlacklistService {
     email: string;
     phoneNumber: string;
     detailAddress: string;
-    address2: string;
     fingerprint: string;
   }) {
     const hits: BlacklistHit[] = [];
     hits.push(...(await this.findByEmail(contact.email)));
     hits.push(...(await this.findByPhoneNumber(contact.phoneNumber)));
     hits.push(...(await this.findByDetailAddress(contact.detailAddress)));
-    hits.push(...(await this.findByAddress2(contact.address2)));
     hits.push(...(await this.findByFingerprint(contact.fingerprint)));
     return { blocked: hits.length > 0, contact, hits };
   }
@@ -441,6 +546,40 @@ export class BlacklistService {
         this.findFirstDeepString(order, new Set(["email", "contact_email", "buyer_account"]))
       )
     );
+  }
+
+  private extractEmailRiskInputs(input: Record<string, unknown>): string[] {
+    const source = input.emails !== undefined ? input.emails : input.email;
+    const rawValues = Array.isArray(source) ? source : [source];
+    const seen = new Set<string>();
+    const emails: string[] = [];
+    for (const raw of rawValues) {
+      const parts = typeof raw === "string" ? raw.split(/[,\s;]+/) : [raw];
+      for (const part of parts) {
+        const email = normalizeEmail(part);
+        if (!email || seen.has(email)) continue;
+        seen.add(email);
+        emails.push(email);
+      }
+    }
+    return emails;
+  }
+
+  private buildDisputeRemark(disputeHits: Array<Record<string, unknown>>): string {
+    const first = disputeHits[0] || {};
+    const disputeId = safeString(first.dispute_id);
+    const buyerEmail = safeString(first.buyer_email);
+    const transactionId = safeString(first.seller_transaction_id || first.transaction_id);
+    const orderId = safeString(first.order_id);
+    return [
+      "⚠️【争议用户】该邮箱关联 PayPal 争议订单",
+      buyerEmail ? `争议邮箱 ${buyerEmail}` : "",
+      disputeId ? `争议ID ${disputeId}` : "",
+      transactionId ? `交易号 ${transactionId}` : "",
+      orderId ? `关联订单 ${orderId}` : ""
+    ]
+      .filter(Boolean)
+      .join("，");
   }
 
   private checkNonRegularEmail(email: string): ScoreExclusionResult {
@@ -860,8 +999,8 @@ export class BlacklistService {
       reasons.push(`已付款订单 ${this.formatRiskNumber(paidCount)} 单 >= 10 单`);
       reasons.push(`大于7天下单间隔次数 ${this.formatRiskNumber(daysOver7)} 个 < 3 个`);
     } else if (paidCount >= 5 && paidCount < 10) {
-      if (unfinishedRatio > 0.3) {
-        reasons.push(`未完成订单占比 ${this.formatRiskPercent(unfinishedRatio)} > 30%`);
+      if (orderedCount >= 5) {
+        reasons.push(`未完成订单数 ${this.formatRiskNumber(orderedCount)} 单 >= 5 单`);
       }
       if (relatedAccountCount >= 3) {
         reasons.push(`关联账号数 ${this.formatRiskNumber(relatedAccountCount)} >= 3`);
@@ -874,8 +1013,8 @@ export class BlacklistService {
       }
       if (reasons.length > 0) ruleCode = "paid_5_to_9_abnormal";
     } else if (paidCount < 5) {
-      if (unfinishedRatio > 0.5) {
-        reasons.push(`未完成订单占比 ${this.formatRiskPercent(unfinishedRatio)} > 50%`);
+      if (orderedCount >= 5) {
+        reasons.push(`未完成订单数 ${this.formatRiskNumber(orderedCount)} 单 >= 5 单`);
       }
       if (relatedAccountCount >= 3) {
         reasons.push(`关联账号数 ${this.formatRiskNumber(relatedAccountCount)} >= 3`);
@@ -1058,21 +1197,6 @@ export class BlacklistService {
        LIMIT 20
     `,
       detailAddress
-    );
-    return rows as BlacklistHit[];
-  }
-  private async findByAddress2(address2: string): Promise<BlacklistHit[]> {
-    if (!address2) return [];
-    const rows = await this.db.$queryRawUnsafe(
-      `
-      SELECT o.id, o.order_id, o.package_number, 'address2' AS hit_type, oa.address2 AS hit_value
-      FROM order_address oa
-      INNER JOIN orders o ON BINARY o.order_id = BINARY oa.order_id
-      WHERE o.black_state = 1
-        AND LOWER(TRIM(COALESCE(oa.address2, ''))) = ?
-      LIMIT 20
-    `,
-      address2
     );
     return rows as BlacklistHit[];
   }

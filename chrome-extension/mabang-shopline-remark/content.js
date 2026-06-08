@@ -184,6 +184,10 @@
     return out;
   }
 
+  function knownOrderIdsInText(text) {
+    return extractOrderIds(text).filter((id) => apiOrderCache.has(id) || noteCache.has(id));
+  }
+
   function findInjectionTarget(row, orderId) {
     if (row.tagName === "TR") {
       const cells = Array.from(row.querySelectorAll("td,th"));
@@ -596,25 +600,25 @@
       const rowItems = [];
       for (const row of rows) {
         const text = collectSearchText(row);
-        const ids = extractOrderIds(text);
+        const ids = knownOrderIdsInText(text);
         if (ids.length === 0) {
-          markEmpty(row);
           continue;
         }
-        const storeHint = extractStoreHint(text);
-        const platformHint = extractPlatformHint(text);
-        rowItems.push({ row, ids, storeHint, platformHint });
+        rowItems.push({ row, ids });
       }
 
       const orders = rowItems
         .flatMap((item) =>
-          item.ids.map((id) => ({
-            platform: item.platformHint || apiOrderCache.get(id)?.platform || "shopline",
-            orderId: id,
-            storeName: item.storeHint || apiOrderCache.get(id)?.storeName || "",
-            customer_note: apiOrderCache.get(id)?.customer_note || ""
-          }))
+          item.ids
+            .filter((id) => apiOrderCache.has(id))
+            .map((id) => ({
+              platform: apiOrderCache.get(id)?.platform || "",
+              orderId: id,
+              storeName: apiOrderCache.get(id)?.storeName || "",
+              customer_note: apiOrderCache.get(id)?.customer_note || ""
+            }))
         )
+        .filter((item) => ["shopline", "shoplazza"].includes(item.platform))
         .slice(0, MAX_IDS_PER_REQUEST);
       let fetchResult = { requestedIds: new Set(), requestedKeys: new Set() };
       if (orders.length > 0) {
@@ -635,10 +639,12 @@
           }
         }
         const allResolved = item.ids.every((id) => {
+          const cached = apiOrderCache.get(id);
+          if (!cached) return noteCache.has(id);
           const key = requestKey({
-            platform: item.platformHint || apiOrderCache.get(id)?.platform || "shopline",
+            platform: cached.platform,
             orderId: id,
-            storeName: item.storeHint || apiOrderCache.get(id)?.storeName || ""
+            storeName: cached.storeName || ""
           });
           return noteCache.has(id) || isMissingCached(key);
         });

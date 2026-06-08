@@ -13,12 +13,11 @@ export class BlacklistController {
     schema: {
       type: "object",
       description:
-        "Blacklist check uses email, phone_number, detail_address, address2, device_fingerprint. detail_address and address2 are matched independently (OR).",
+        "Blacklist check uses email, phone_number, detail_address, device_fingerprint.",
       properties: {
         email: { type: "string", example: "risk.user@example.com" },
         phone_number: { type: "string", example: "14155551234" },
         detail_address: { type: "string", example: "123 Main Street" },
-        address2: { type: "string", example: "Apt 6" },
         device_fingerprint: { type: "string", example: "fp_test_abc_001" },
         fingerprint: { type: "string", example: "fp_test_abc_001" },
         deviceFingerprint: { type: "string", example: "fp_test_abc_001" }
@@ -42,5 +41,24 @@ export class BlacklistController {
   })
   async score(@Body() body: Record<string, unknown>) {
     return this.blacklistService.scoreByInput(body || {});
+  }
+
+  @Post("email-risk/check")
+  @ApiOperation({ summary: "Batch check email blacklist, dispute, risk score, and shipping decision" })
+  @ApiBody({
+    schema: {
+      type: "object",
+      properties: {
+        email: { type: "string", example: "buyer@example.com" },
+        emails: {
+          type: "array",
+          items: { type: "string" },
+          example: ["buyer@example.com", "risk.user@example.com"]
+        }
+      }
+    }
+  })
+  async checkEmailRisk(@Body() body: Record<string, unknown>) {
+    return this.blacklistService.checkEmailRiskByInput(body || {});
   }
 }

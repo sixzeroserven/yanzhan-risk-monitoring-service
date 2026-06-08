@@ -236,7 +236,9 @@ export class ShoplineService implements OnModuleInit {
   async lookupCustomerNotesForOrders(
     orders: ShoplineCustomerNoteRequest[]
   ): Promise<Record<string, ShoplineCustomerNoteLookup>> {
-    const uniqueOrders = this.uniqueCustomerNoteRequests(orders);
+    const uniqueOrders = this.uniqueCustomerNoteRequests(orders).filter((item) =>
+      this.isValidShoplineOrderId(item.orderId)
+    );
     const result: Record<string, ShoplineCustomerNoteLookup> = {};
     if (uniqueOrders.length === 0) return result;
 
@@ -268,45 +270,13 @@ export class ShoplineService implements OnModuleInit {
             pending.delete(matchedId);
           }
         } catch (error) {
+          if (this.isInvalidIdsError(error)) continue;
           this.logger.debug(
             `Shopline risk_note 批量查询跳过：store=${store.storeDomain} count=${batchIds.length} ${this.formatAxiosError(error)}`
           );
         }
       }
       if (pending.size === 0) break;
-    }
-
-    const hintedStillPending = Array.from(pending.values()).filter((item) => this.hasStoreHint(item));
-    if (hintedStillPending.length > 0) {
-      // If the page's store hint was wrong or matched the wrong config, fall back to all stores.
-      for (const store of stores) {
-        const idsForStore = hintedStillPending.map((item) => item.orderId).filter((orderId) => pending.has(orderId));
-        for (const batchIds of this.chunk(idsForStore, 50)) {
-          if (batchIds.length === 0) continue;
-          try {
-            const resp = await this.client(store.storeDomain).get(this.orderCollectionPath(batchIds));
-            const rows = this.pickOrderArray(resp.data);
-            const batchSet = new Set(batchIds);
-            for (const order of rows) {
-              const matchedId = this.matchRequestedOrderId(order, batchSet);
-              if (!matchedId || !pending.has(matchedId)) continue;
-              const customerNote = this.extractCustomerNote(order);
-              if (!customerNote) continue;
-              result[matchedId] = {
-                orderId: matchedId,
-                customer_note: customerNote,
-                storeDomain: store.storeDomain
-              };
-              pending.delete(matchedId);
-            }
-          } catch (error) {
-            this.logger.debug(
-              `Shopline risk_note 兜底查询跳过：store=${store.storeDomain} count=${batchIds.length} ${this.formatAxiosError(error)}`
-            );
-          }
-        }
-        if (pending.size === 0) break;
-      }
     }
 
     return result;
@@ -534,8 +504,14 @@ export class ShoplineService implements OnModuleInit {
     return hints.some((hint) => this.storeMatchesHint(store, hint));
   }
 
-  private hasStoreHint(order: ShoplineCustomerNoteRequest): boolean {
-    return Boolean(String(order.storeDomain || order.storeName || "").trim());
+  private isValidShoplineOrderId(orderId: string): boolean {
+    return /^2\d{25}$/.test(String(orderId || "").trim());
+  }
+
+  private isInvalidIdsError(error: unknown): boolean {
+    if (!axios.isAxiosError(error)) return false;
+    const responseText = JSON.stringify(error.response?.data || "");
+    return error.response?.status === 422 && /ids:\s*seq format invalid/i.test(responseText);
   }
 
   private storeMatchesHint(store: ShoplineStoreConfig, rawHint: string): boolean {

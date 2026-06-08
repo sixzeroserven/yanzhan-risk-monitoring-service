@@ -25,9 +25,9 @@ export function joinAddressParts(address: Record<string, unknown> = {}): string 
   return normalizeAddress(parts.join(" "));
 }
 
-/** Only detail line + address2 — used for blacklist matching (excludes city/country/zip/address1). */
+/** Only detail line — used for blacklist matching (excludes address2/city/country/zip/address1). */
 export function joinBlacklistAddressParts(address: Record<string, unknown> = {}): string {
-  const parts = [address.detail_address, address.address2].map(safeString).filter(Boolean);
+  const parts = [address.detail_address].map(safeString).filter(Boolean);
   return normalizeAddress(parts.join(" "));
 }
 export function getDeviceFingerprint(order: Record<string, unknown> = {}): string {

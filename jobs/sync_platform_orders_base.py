@@ -394,6 +394,17 @@ def pick_order_id(platform: str, order: Dict[str, Any], store: Dict[str, str]) -
     )
 
 
+def pick_shopline_legacy_order_id(store: Dict[str, str], order: Dict[str, Any]) -> Optional[str]:
+    prefix = first_str(store.get("orderIdPrefix"), max_len=80)
+    display = normalize_hash_order_number(
+        first_str(order.get("name"), order.get("order_name"), order.get("orderName"))
+    )
+    if not prefix or not display:
+        return None
+    legacy_id = display if display.startswith(prefix) else f"{prefix}{display}"
+    return legacy_id[:100]
+
+
 def pick_detail_id(order: Dict[str, Any], fallback_order_id: str) -> str:
     return first_str(
         order.get("id"),
@@ -881,10 +892,36 @@ def nonempty_update_items(row: Dict[str, Any], columns: Tuple[str, ...]) -> List
     return out
 
 
+def order_exists(cursor, order_id: str) -> bool:
+    cursor.execute("SELECT COUNT(1) FROM orders WHERE BINARY order_id = BINARY %s", (order_id,))
+    return bool(cursor.fetchone()[0])
+
+
+def apply_shopline_legacy_order_id_fallback(
+    cursor,
+    platform: str,
+    store: Dict[str, str],
+    base: Dict[str, Any],
+    row: Dict[str, Any],
+    stats: Dict[str, int],
+) -> None:
+    if platform != "shopline":
+        return
+    current_order_id = str(row.get("order_id") or "").strip()
+    if not current_order_id or order_exists(cursor, current_order_id):
+        return
+    legacy_order_id = pick_shopline_legacy_order_id(store, base)
+    if not legacy_order_id or legacy_order_id == current_order_id:
+        return
+    if not order_exists(cursor, legacy_order_id):
+        return
+    row["order_id"] = legacy_order_id
+    add_stat(stats, "shopline_legacy_orders_matched")
+
+
 def upsert_order(cursor, row: Dict[str, Any], dry_run: bool) -> str:
     order_id = row["order_id"]
-    cursor.execute("SELECT COUNT(1) FROM orders WHERE BINARY order_id = BINARY %s", (order_id,))
-    exists = bool(cursor.fetchone()[0])
+    exists = order_exists(cursor, order_id)
     items = nonempty_update_items(row, ORDER_UPDATE_COLUMNS)
 
     if dry_run:
@@ -976,6 +1013,7 @@ def process_one_order(
             reason,
         )
         return
+    apply_shopline_legacy_order_id_fallback(cursor, platform, store, base, row, stats)
     if debug_fetch and debug_budget[0] != 0:
         logger.info("[debug-fetch] %s", format_debug(platform, store, raw, base, row))
         if debug_budget[0] > 0:
